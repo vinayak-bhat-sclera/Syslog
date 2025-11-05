@@ -1,0 +1,10 @@
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+mysql-connector-python>=8.0.0
+pydantic-settings>=2.0
+sentence-transformers>=2.2.2
+scikit-learn>=1.2.0
+numpy>=1.24.0
+aiohttp>=3.9.0           # for async HTTP requests to Spring Boot
+python-dotenv>=1.0.0     # for .env config loading
+aioredis>=2.0.1          # for async Redis caching (device IP mappings, etc.)
