@@ -1,0 +1,20 @@
+cache monitor apis
+
+curl -X GET http://localhost:7799/api/cache/status | jq
+
+{
+  "total_cached": 2,
+  "cache_ttl_sec": 3600,
+  "items": [
+    {"ip": "10.2.30.250", "device_id": "b3746b1c-d1c2-4b15-a97f-b71f5b2ca895", "expires_in_sec": 3542},
+    {"ip": "10.2.31.10", "device_id": "a12f6e23-45cc-4d1c-98fa-991d833f8a12", "expires_in_sec": 3421}
+  ]
+}
+
+remove an entry
+curl -X DELETE http://localhost:7799/api/cache/10.2.31.10
+
+clear entire cache
+curl -X DELETE http://localhost:7799/api/cache/clear
+
+

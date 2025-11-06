@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.db import init_db
 from app.utils.logging import configure_logging
-from app.routers import profiles, integrations, profile_devices, incidents, health
+from app.routers import profiles, integrations, profile_devices, incidents, health, cache_monitor
 from app.services.udp_server import start_udp_server
 
 configure_logging()
@@ -19,6 +19,7 @@ app.include_router(profiles.router, prefix="/api", tags=["profiles"])
 app.include_router(integrations.router, prefix="/api", tags=["integrations"])
 app.include_router(profile_devices.router, prefix="/api", tags=["profile_devices"])
 app.include_router(incidents.router, prefix="/api", tags=["incidents"])
+app.include_router(cache_monitor.router, prefix="/api")
 
 udp_task: asyncio.Task | None = None
 

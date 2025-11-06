@@ -22,11 +22,6 @@ class Settings(BaseSettings):
     SIMILARITY_THRESHOLD: float = Field(0.6, env="SIMILARITY_THRESHOLD")
     LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
 
-    # ─────────────────────────────
-    # Redis Configuration
-    # ─────────────────────────────
-    REDIS_HOST: str = Field("127.0.0.1", env="REDIS_HOST")
-    REDIS_PORT: int = Field(6379, env="REDIS_PORT")
 
     # ─────────────────────────────
     # Spring Boot Service

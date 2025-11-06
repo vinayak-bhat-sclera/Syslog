@@ -1,51 +1,84 @@
 # app/services/device_cache.py
 import logging
+import time
 import requests
-import redis
-from typing import Optional
+from typing import Optional, Dict, Tuple
+
 from app.config import settings
 
 logger = logging.getLogger("app.services.device_cache")
 
-try:
-    redis_client = redis.StrictRedis(
-        host=settings.REDIS_HOST,
-        port=settings.REDIS_PORT,
-        db=0,
-        decode_responses=True
-    )
-    logger.info("Connected to Redis successfully.")
-except Exception as e:
-    logger.exception("Failed to connect to Redis: %s", e)
-    redis_client = None
+# ─────────────────────────────
+# In-memory cache structure
+# ─────────────────────────────
+# ip_to_device[ip] = (device_id, expiry_timestamp)
+# device_to_ip[device_id] = ip
+ip_to_device: Dict[str, Tuple[str, float]] = {}
+device_to_ip: Dict[str, str] = {}
 
+# Cache expiration (seconds)
 CACHE_TTL = 3600  # 1 hour
 
 
-def get_device_id(ip: str) -> Optional[str]:
+# ─────────────────────────────
+# Core cache functions
+# ─────────────────────────────
+def get_device_id_for_ip(ip: str) -> Optional[str]:
     """
-    Get device_id for an IP.
-    Checks Redis first, then Spring Boot, then caches.
+    Get device_id for a given IP from the in-memory cache.
+    If expired or missing, return None.
     """
-    if not redis_client:
-        return fetch_device_from_api(ip)
+    entry = ip_to_device.get(ip)
+    if not entry:
+        return None
 
-    device_id = redis_client.get(ip)
-    if device_id:
-        logger.debug("Cache hit: %s → %s", ip, device_id)
-        return device_id
+    device_id, expiry = entry
+    if time.time() > expiry:
+        # Expired → remove from cache
+        ip_to_device.pop(ip, None)
+        device_to_ip.pop(device_id, None)
+        logger.debug("Cache expired for IP %s", ip)
+        return None
 
-    device_id = fetch_device_from_api(ip)
-    if device_id:
-        redis_client.setex(ip, CACHE_TTL, device_id)
-        logger.info("Cached mapping %s → %s", ip, device_id)
     return device_id
 
 
+def set_device_id_cache(ip: str, device_id: str):
+    """
+    Store a mapping in cache for both directions (ip → device_id and device_id → ip).
+    """
+    expiry = time.time() + CACHE_TTL
+    ip_to_device[ip] = (device_id, expiry)
+    device_to_ip[device_id] = ip
+    logger.debug("Cache updated: %s ↔ %s (expires in %ds)", ip, device_id, CACHE_TTL)
+
+
+def remove_device_mapping(device_id: str):
+    """
+    Remove a device's cached entry by device_id.
+    Automatically removes both ip → device_id and device_id → ip mappings.
+    """
+    ip = device_to_ip.pop(device_id, None)
+    if ip:
+        ip_to_device.pop(ip, None)
+        logger.debug("Removed cache mapping for device_id=%s (ip=%s)", device_id, ip)
+    else:
+        logger.debug("No cached mapping found for device_id=%s", device_id)
+
+
+def clear_cache():
+    """Clear the entire cache (for full reset)."""
+    ip_to_device.clear()
+    device_to_ip.clear()
+    logger.warning("In-memory device cache cleared")
+
+
+# ─────────────────────────────
+# Fallback: Fetch from Spring Boot API if not cached
+# ─────────────────────────────
 def fetch_device_from_api(ip: str) -> Optional[str]:
     """
-    Call Spring Boot for IP → device_id mapping.
-    Adjust the endpoint as per your Spring Boot service.
+    Call Spring Boot to fetch device_id for the given IP.
     """
     url = f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}/api/device/by-ip/{ip}"
     try:
@@ -54,23 +87,29 @@ def fetch_device_from_api(ip: str) -> Optional[str]:
             data = resp.json()
             device_id = data.get("device_id")
             if device_id:
-                logger.debug("API: %s → %s", ip, device_id)
+                logger.info("[SPRINGBOOT LOOKUP] %s → %s", ip, device_id)
+                set_device_id_cache(ip, device_id)
                 return device_id
-        logger.warning("API failed (%s): %s", resp.status_code, url)
+        else:
+            logger.warning("Spring Boot lookup failed (%s): %s", resp.status_code, url)
     except Exception as e:
-        logger.exception("API error for %s: %s", ip, e)
+        logger.exception("Spring Boot API error for %s: %s", ip, e)
     return None
 
 
-def remove_device_mapping(ip: str):
-    """Remove a cached mapping."""
-    if redis_client:
-        redis_client.delete(ip)
-        logger.info("Removed cache for %s", ip)
+# ─────────────────────────────
+# Unified resolver used by UDP server
+# ─────────────────────────────
+def resolve_device_id(ip: str) -> Optional[str]:
+    """
+    Unified resolver:
+    1. Check in-memory cache
+    2. If missing or expired → call Spring Boot → update cache
+    """
+    cached = get_device_id_for_ip(ip)
+    if cached:
+        logger.debug("[CACHE HIT] %s → %s", ip, cached)
+        return cached
 
-
-def clear_cache():
-    """Clear all mappings."""
-    if redis_client:
-        redis_client.flushdb()
-        logger.warning("Redis cache cleared")
+    logger.debug("[CACHE MISS] %s → fetching from Spring Boot", ip)
+    return fetch_device_from_api(ip)
