@@ -8,7 +8,7 @@ class ProfileBase(BaseModel):
     priorities: Optional[List[int]] = Field(None, description="List of priority codes")
     facilities: Optional[List[int]] = Field(None, description="List of facility codes")
     keywords: Optional[List[str]] = Field(None, description="List of keywords for matching")
-    devices: Optional[List[str]] = Field(None, description="List of device UUIDs associated with this profile")
+    device_uuids: Optional[List[str]] = Field(None, description="Device UUIDs associated with this profile")
 
 
 class ProfileIn(ProfileBase):
@@ -22,7 +22,7 @@ class ProfileIn(ProfileBase):
 class ProfileUpdate(ProfileBase):
     """
     For updating existing profiles:
-    - `type` and `network` cannot be updated.
-    - If `devices` is omitted, device mappings remain unchanged.
+    - `type` and `network` cannot be changed.
+    - `device_uuids` optional: if omitted, mappings remain unchanged.
     """
     pass

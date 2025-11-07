@@ -1,7 +1,7 @@
 # app/models/incidents.py
-# currently not used in request bodies but placeholder for future typed responses
-from pydantic import BaseModel
 from typing import Optional
+from pydantic import BaseModel
+
 
 class Incident(BaseModel):
     id: str

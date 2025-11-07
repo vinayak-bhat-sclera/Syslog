@@ -1,115 +1,126 @@
 # app/services/device_cache.py
-import logging
+import asyncio
 import time
-import requests
-from typing import Optional, Dict, Tuple
+import logging
+from typing import Optional, Dict
+
+import aiohttp
 
 from app.config import settings
 
 logger = logging.getLogger("app.services.device_cache")
 
-# ─────────────────────────────
-# In-memory cache structure
-# ─────────────────────────────
-# ip_to_device[ip] = (device_id, expiry_timestamp)
-# device_to_ip[device_id] = ip
-ip_to_device: Dict[str, Tuple[str, float]] = {}
-device_to_ip: Dict[str, str] = {}
-
-# Cache expiration (seconds)
-CACHE_TTL = 3600  # 1 hour
+# in-memory cache: ip -> (device_id, expiry_ts)
+_DEVICE_CACHE: Dict[str, tuple] = {}
+_CACHE_LOCK = asyncio.Lock()
+CACHE_TTL = getattr(settings, "CACHE_TTL", 3600)  # seconds
 
 
-# ─────────────────────────────
-# Core cache functions
-# ─────────────────────────────
-def get_device_id_for_ip(ip: str) -> Optional[str]:
+async def _fetch_from_springboot(ip: str) -> Optional[str]:
     """
-    Get device_id for a given IP from the in-memory cache.
-    If expired or missing, return None.
-    """
-    entry = ip_to_device.get(ip)
-    if not entry:
-        return None
-
-    device_id, expiry = entry
-    if time.time() > expiry:
-        # Expired → remove from cache
-        ip_to_device.pop(ip, None)
-        device_to_ip.pop(device_id, None)
-        logger.debug("Cache expired for IP %s", ip)
-        return None
-
-    return device_id
-
-
-def set_device_id_cache(ip: str, device_id: str):
-    """
-    Store a mapping in cache for both directions (ip → device_id and device_id → ip).
-    """
-    expiry = time.time() + CACHE_TTL
-    ip_to_device[ip] = (device_id, expiry)
-    device_to_ip[device_id] = ip
-    logger.debug("Cache updated: %s ↔ %s (expires in %ds)", ip, device_id, CACHE_TTL)
-
-
-def remove_device_mapping(device_id: str):
-    """
-    Remove a device's cached entry by device_id.
-    Automatically removes both ip → device_id and device_id → ip mappings.
-    """
-    ip = device_to_ip.pop(device_id, None)
-    if ip:
-        ip_to_device.pop(ip, None)
-        logger.debug("Removed cache mapping for device_id=%s (ip=%s)", device_id, ip)
-    else:
-        logger.debug("No cached mapping found for device_id=%s", device_id)
-
-
-def clear_cache():
-    """Clear the entire cache (for full reset)."""
-    ip_to_device.clear()
-    device_to_ip.clear()
-    logger.warning("In-memory device cache cleared")
-
-
-# ─────────────────────────────
-# Fallback: Fetch from Spring Boot API if not cached
-# ─────────────────────────────
-def fetch_device_from_api(ip: str) -> Optional[str]:
-    """
-    Call Spring Boot to fetch device_id for the given IP.
+    Async request to Spring Boot to resolve ip -> device_id.
+    Expects Spring Boot endpoint that returns JSON { "device_id": "..." }.
     """
     url = f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}/api/device/by-ip/{ip}"
     try:
-        resp = requests.get(url, timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            device_id = data.get("device_id")
-            if device_id:
-                logger.info("[SPRINGBOOT LOOKUP] %s → %s", ip, device_id)
-                set_device_id_cache(ip, device_id)
-                return device_id
-        else:
-            logger.warning("Spring Boot lookup failed (%s): %s", resp.status_code, url)
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    device_id = data.get("device_id") or data.get("deviceId") or data.get("id")
+                    if device_id:
+                        return device_id
+                else:
+                    text = await resp.text()
+                    logger.warning("SpringBoot lookup failed (%s): %s -> %s", resp.status, url, text[:200])
     except Exception as e:
-        logger.exception("Spring Boot API error for %s: %s", ip, e)
+        logger.exception("SpringBoot lookup error for %s: %s", ip, e)
     return None
 
 
-# ─────────────────────────────
-# Unified resolver used by UDP server
-# ─────────────────────────────
-def resolve_device_id(ip: str) -> Optional[str]:
+async def get_device_id(ip: str) -> Optional[str]:
     """
-    Unified resolver:
-    1. Check in-memory cache
-    2. If missing or expired → call Spring Boot → update cache
+    Async lookup: check local cache, if miss call SpringBoot and cache result.
     """
-    cached = get_device_id_for_ip(ip)
-    if cached:
-        logger.debug("[CACHE HIT] %s → %s", ip, cached)
-        return cached
+    now = int(time.time())
+    async with _CACHE_LOCK:
+        entry = _DEVICE_CACHE.get(ip)
+        if entry:
+            device_id, expiry = entry
+            if expiry > now:
+                logger.debug("[DEVICE_CACHE HIT] %s -> %s", ip, device_id)
+                return device_id
+            else:
+                # expired
+                _DEVICE_CACHE.pop(ip, None)
 
-    logger.debug("[CACHE MISS] %s → fetching from Spring Boot", ip)
-    return fetch_device_from_api(ip)
+    # cache miss -> call springboot
+    device_id = await _fetch_from_springboot(ip)
+    if device_id:
+        async with _CACHE_LOCK:
+            _DEVICE_CACHE[ip] = (device_id, int(time.time()) + CACHE_TTL)
+            logger.info("[DEVICE_CACHE SET] %s -> %s (ttl=%ds)", ip, device_id, CACHE_TTL)
+    else:
+        logger.debug("[DEVICE_CACHE MISS] no mapping for %s", ip)
+    return device_id
+
+
+async def set_device_cache(ip: str, device_id: str, ttl: Optional[int] = None) -> None:
+    """Manually set ip->device_id mapping in cache."""
+    if ttl is None:
+        ttl = CACHE_TTL
+    async with _CACHE_LOCK:
+        _DEVICE_CACHE[ip] = (device_id, int(time.time()) + ttl)
+        logger.info("[DEVICE_CACHE MANUAL SET] %s -> %s (ttl=%ds)", ip, device_id, ttl)
+
+
+async def remove_device_cache_for_ip(ip: str) -> None:
+    async with _CACHE_LOCK:
+        _DEVICE_CACHE.pop(ip, None)
+        logger.debug("[DEVICE_CACHE EVICT] %s", ip)
+
+
+async def clear_cache() -> None:
+    """Clear entire in-memory cache."""
+    async with _CACHE_LOCK:
+        _DEVICE_CACHE.clear()
+    logger.warning("Device cache flushed (in-memory).")
+
+
+async def clear_profile_devices(profile_id: str) -> None:
+    """
+    Remove cached entries that belong to mappings in profile_id.
+    This function is used after profile update/delete to evict any ip entries associated with mappings.
+    It checks DB to find IPs for that profile and evicts them.
+    """
+    # Lazy import to avoid cycle
+    from app.db import get_db_connection
+
+    ips = []
+    try:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT pd.device_id AS device_id FROM syslog_profile_devices pd WHERE pd.profile_id=%s",
+                (profile_id,),
+            )
+            rows = cursor.fetchall() or []
+            cursor.close()
+            for r in rows:
+                # We don't have ip stored in profile_devices (design), so only evict entries where device_id maps.
+                # Try to evict cached entries with that device_id.
+                device_id = r.get("device_id")
+                ips.append(device_id)
+    except Exception:
+        logger.exception("Error loading profile device_ids for cache eviction")
+
+    # Evict any cache entries where value == device_id
+    async with _CACHE_LOCK:
+        to_remove = []
+        for ip, (did, _) in _DEVICE_CACHE.items():
+            if did in ips:
+                to_remove.append(ip)
+        for ip in to_remove:
+            _DEVICE_CACHE.pop(ip, None)
+            logger.debug("Evicted cached ip %s for profile %s", ip, profile_id)

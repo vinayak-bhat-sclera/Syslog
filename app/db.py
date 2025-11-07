@@ -21,7 +21,6 @@ DB_CONFIG = {
 
 
 def _init_pool(db_name: str):
-    """Initialize a MySQL connection pool."""
     global _pool
     if _pool is not None:
         return
@@ -47,7 +46,6 @@ def _init_pool(db_name: str):
 
 @contextlib.contextmanager
 def get_db_connection(db_name: Optional[str] = None):
-    """Context manager to safely yield a DB connection from pool."""
     global _pool
     if _pool is None:
         _init_pool(db_name or settings.DB_NAME)
@@ -67,10 +65,8 @@ def get_db_connection(db_name: Optional[str] = None):
 
 
 def init_db():
-    """Create the database and required tables if they do not exist (UUID-based IDs)."""
     tmp_cfg = DB_CONFIG.copy()
 
-    # Connect to MySQL server without selecting a DB
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
@@ -96,71 +92,67 @@ def init_db():
     with get_db_connection(settings.DB_NAME) as cnx:
         cursor = cnx.cursor()
         try:
-            # ───────────────────────────────
-            # syslog_profiles
-            # ───────────────────────────────
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS syslog_profiles (
-                id CHAR(36) PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                type ENUM('internal','external') NOT NULL,
-                network VARCHAR(100),
-                priorities JSON DEFAULT NULL,
-                facilities JSON DEFAULT NULL,
-                keywords JSON DEFAULT NULL
-            ) ENGINE=InnoDB;
-            """)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS syslog_profiles (
+                    id CHAR(36) PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    type ENUM('internal','external') NOT NULL,
+                    network VARCHAR(100),
+                    priorities JSON DEFAULT NULL,
+                    facilities JSON DEFAULT NULL,
+                    keywords JSON DEFAULT NULL
+                ) ENGINE=InnoDB;
+                """
+            )
             cursor.execute("SHOW INDEX FROM syslog_profiles WHERE Key_name = %s", ("idx_syslog_profiles_type",))
             if not cursor.fetchall():
                 cursor.execute("CREATE INDEX idx_syslog_profiles_type ON syslog_profiles(type)")
 
-            # ───────────────────────────────
-            # syslog_integration
-            # ───────────────────────────────
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS syslog_integration (
-                id CHAR(36) PRIMARY KEY,
-                profile_id CHAR(36) NOT NULL,
-                destination_name VARCHAR(100),
-                destination_type VARCHAR(100),
-                ip_address VARCHAR(45),
-                port INT,
-                auth_token VARCHAR(255) NULL,
-                FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE CASCADE
-            ) ENGINE=InnoDB;
-            """)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS syslog_integration (
+                    id CHAR(36) PRIMARY KEY,
+                    profile_id CHAR(36) NOT NULL,
+                    destination_name VARCHAR(100),
+                    destination_type VARCHAR(100),
+                    ip_address VARCHAR(45),
+                    port INT,
+                    auth_token VARCHAR(255) NULL,
+                    network VARCHAR(100),
+                    FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB;
+                """
+            )
 
-            # ───────────────────────────────
-            # syslog_profile_devices
-            # ───────────────────────────────
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS syslog_profile_devices (
-                id CHAR(36) PRIMARY KEY,
-                profile_id CHAR(36) NOT NULL,
-                device_id CHAR(36) NOT NULL,
-                FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE CASCADE,
-                UNIQUE KEY ux_profile_device (profile_id, device_id)
-            ) ENGINE=InnoDB;
-            """)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS syslog_profile_devices (
+                    id CHAR(36) PRIMARY KEY,
+                    profile_id CHAR(36) NOT NULL,
+                    device_id VARCHAR(128) NOT NULL,
+                    FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE CASCADE,
+                    UNIQUE KEY ux_profile_device (profile_id, device_id)
+                ) ENGINE=InnoDB;
+                """
+            )
 
-            # ───────────────────────────────
-            # syslog_incidents
-            # ───────────────────────────────
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS syslog_incidents (
-                id CHAR(36) PRIMARY KEY,
-                device_id CHAR(36) NOT NULL,
-                profile_id CHAR(36),
-                priority_code INT,
-                facility_code INT,
-                message TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE SET NULL
-            ) ENGINE=InnoDB;
-            """)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS syslog_incidents (
+                    id CHAR(36) PRIMARY KEY,
+                    device_id VARCHAR(128) NOT NULL,
+                    profile_id CHAR(36),
+                    priority_code INT,
+                    facility_code INT,
+                    message TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE SET NULL
+                ) ENGINE=InnoDB;
+                """
+            )
 
             cnx.commit()
-            logger.info("✅ All DB tables initialized successfully — no ip_address in syslog_profile_devices.")
-
+            logger.info("DB tables initialized successfully.")
         finally:
             cursor.close()
