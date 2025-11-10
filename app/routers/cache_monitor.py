@@ -1,49 +1,28 @@
 # app/routers/cache_monitor.py
-import time
 import logging
-from fastapi import APIRouter, HTTPException
-from app.services.device_cache import DEVICE_CACHE, clear_cache, remove_device_mapping
+from fastapi import APIRouter
+from app.services.device_cache import clear_cache
 
 router = APIRouter()
 logger = logging.getLogger("app.routers.cache_monitor")
 
 
 @router.get("/cache/status")
-def cache_status():
+async def get_cache_status():
     """
-    Show all IP → device_id mappings currently in the in-memory cache.
+    Return basic in-memory cache stats (size, keys).
     """
-    now = time.time()
-    items = [
-        {
-            "ip": ip,
-            "device_id": val[0],
-            "expires_in_sec": max(0, int(val[1] - now))
-        }
-        for ip, val in DEVICE_CACHE.items()
-    ]
-    return {
-        "total_cached": len(items),
-        "cache_ttl_sec": 3600,
-        "items": items
-    }
+    from app.services.device_cache import _DEVICE_CACHE  # internal import, read-only
+    total = len(_DEVICE_CACHE)
+    keys_preview = list(_DEVICE_CACHE.keys())[:10]
+    return {"total_entries": total, "sample_keys": keys_preview}
 
 
-@router.delete("/cache/{ip}")
-def delete_cache_entry(ip: str):
+@router.post("/cache/clear")
+async def clear_entire_cache():
     """
-    Remove a specific IP entry from the cache.
+    Clear all in-memory cache entries.
     """
-    if ip not in DEVICE_CACHE:
-        raise HTTPException(status_code=404, detail=f"No cache entry for {ip}")
-    remove_device_mapping(ip)
-    return {"status": "removed", "ip": ip}
-
-
-@router.delete("/cache/clear")
-def clear_all_cache():
-    """
-    Clear the entire in-memory cache.
-    """
-    clear_cache()
-    return {"status": "cleared", "total_now": 0}
+    await clear_cache()
+    logger.warning("Cache cleared via API.")
+    return {"status": "cleared"}
