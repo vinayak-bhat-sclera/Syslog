@@ -6,7 +6,6 @@ from pydantic import BaseModel, validator, Field
 class IntegrationIn(BaseModel):
     profile_id: str = Field(..., description="Associated profile ID")
     destination_name: Optional[str] = Field(None, description="Integration destination name (e.g. Splunk, ELK)")
-    destination_type: Optional[str] = Field(None, description="Integration type (e.g. external API, syslog forward)")
     ip_address: str = Field(..., description="Destination IP address or hostname")
     port: int = Field(..., description="Destination port number")
     auth_token: Optional[str] = Field(None, description="Optional auth token (required for Splunk)")

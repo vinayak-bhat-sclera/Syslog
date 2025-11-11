@@ -109,21 +109,22 @@ def init_db():
             if not cursor.fetchall():
                 cursor.execute("CREATE INDEX idx_syslog_profiles_type ON syslog_profiles(type)")
 
+            # inside init_db()
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS syslog_integration (
                     id CHAR(36) PRIMARY KEY,
                     profile_id CHAR(36) NOT NULL,
                     destination_name VARCHAR(100),
-                    destination_type VARCHAR(100),
                     ip_address VARCHAR(45),
                     port INT,
                     auth_token VARCHAR(255) NULL,
                     network VARCHAR(100),
                     FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE CASCADE
                 ) ENGINE=InnoDB;
-                """
-            )
+            """
+)
+
 
             cursor.execute(
                 """

@@ -12,35 +12,59 @@ router = APIRouter()
 logger = logging.getLogger("app.routers.integrations")
 
 
+# ─────────────────────────────
+# Helpers
+# ─────────────────────────────
 def _validate_network_for_profile(profile_id: str, network: str):
+    """Ensure the given profile_id belongs to the specified network."""
     with get_db_connection() as cnx:
         cursor = cnx.cursor()
         cursor.execute("SELECT network FROM syslog_profiles WHERE id=%s", (profile_id,))
         row = cursor.fetchone()
         cursor.close()
     if not row:
-        raise HTTPException(status_code=404, detail="Profile not found for provided profile_id")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found for provided profile_id",
+        )
     if row[0] != network:
-        raise HTTPException(status_code=403, detail="Network mismatch for profile_id")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Network mismatch for provided profile_id",
+        )
 
 
+# ─────────────────────────────
+# Create Integration
+# ─────────────────────────────
 @router.post("/syslog_integrations", status_code=status.HTTP_201_CREATED)
 def create_integration(
     i: integ_models.IntegrationIn,
-    network: str = Query(..., description="Network this integration belongs to")
+    network: str = Query(..., description="Network this integration belongs to"),
 ) -> Dict[str, str]:
-    """Create a new syslog integration destination. network required."""
-    # validate profile belongs to same network
+    """Create a new syslog integration destination."""
     _validate_network_for_profile(i.profile_id, network)
 
     iid = str(uuid.uuid4())
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor()
-            cursor.execute("""
-                INSERT INTO syslog_integration (id, profile_id, destination_name, destination_type, ip_address, port, auth_token)
+            cursor.execute(
+                """
+                INSERT INTO syslog_integration 
+                (id, profile_id, destination_name, ip_address, port, auth_token, network)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (iid, i.profile_id, i.destination_name, i.destination_type, i.ip_address, i.port, i.auth_token))
+                """,
+                (
+                    iid,
+                    i.profile_id,
+                    i.destination_name,
+                    i.ip_address,
+                    i.port,
+                    i.auth_token,
+                    network,
+                ),
+            )
             cnx.commit()
             cursor.close()
     except Exception as e:
@@ -49,48 +73,72 @@ def create_integration(
     return {"status": "created", "id": iid}
 
 
-@router.put("/syslog_integrations/{integration_id}", status_code=status.HTTP_200_OK)
+# ─────────────────────────────
+# Update Integration
+# ─────────────────────────────
+@router.put("/syslog_integrations", status_code=status.HTTP_200_OK)
 def update_integration(
-    integration_id: str,
-    i: integ_models.IntegrationIn,
-    network: str = Query(..., description="Network must match profile's network")
+    integration_id: str = Query(..., description="Integration ID to update"),
+    i: integ_models.IntegrationIn = None,
+    network: str = Query(..., description="Network must match the profile's network"),
 ):
-    # ensure integration exists and belongs to profile with the network
+    """Update an existing integration (query-param style)."""
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (integration_id,))
-        row = cursor.fetchone()
+        existing = cursor.fetchone()
         cursor.close()
-    if not row:
+
+    if not existing:
         raise HTTPException(status_code=404, detail="Integration not found")
-    _validate_network_for_profile(i.profile_id, network)
+
+    _validate_network_for_profile(existing["profile_id"], network)
 
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor()
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE syslog_integration
-                SET destination_name=%s, destination_type=%s, ip_address=%s, port=%s, auth_token=%s
+                SET destination_name=%s, ip_address=%s, port=%s, auth_token=%s, profile_id=%s
                 WHERE id=%s
-            """, (i.destination_name, i.destination_type, i.ip_address, i.port, i.auth_token, integration_id))
+                """,
+                (
+                    i.destination_name,
+                    i.ip_address,
+                    i.port,
+                    i.auth_token,
+                    i.profile_id,
+                    integration_id,
+                ),
+            )
             cnx.commit()
             cursor.close()
     except Exception as e:
         logger.exception("update_integration failed")
         raise HTTPException(status_code=400, detail=str(e))
+
     return {"status": "updated", "id": integration_id}
 
 
-@router.delete("/syslog_integrations/{integration_id}", status_code=status.HTTP_200_OK)
-def delete_integration(integration_id: str, network: str = Query(...)):
+# ─────────────────────────────
+# Delete Integration
+# ─────────────────────────────
+@router.delete("/syslog_integrations", status_code=status.HTTP_200_OK)
+def delete_integration(
+    integration_id: str = Query(..., description="Integration ID to delete"),
+    network: str = Query(..., description="Network this integration belongs to"),
+):
+    """Delete an integration (query-param style)."""
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (integration_id,))
         row = cursor.fetchone()
         cursor.close()
+
     if not row:
         raise HTTPException(status_code=404, detail="Integration not found")
-    # validate network (profile -> network)
+
     _validate_network_for_profile(row["profile_id"], network)
 
     try:
@@ -99,12 +147,16 @@ def delete_integration(integration_id: str, network: str = Query(...)):
             cursor.execute("DELETE FROM syslog_integration WHERE id=%s", (integration_id,))
             cnx.commit()
             cursor.close()
-    except Exception:
+    except Exception as e:
         logger.exception("delete_integration failed")
-        raise HTTPException(status_code=400, detail="DB error deleting integration")
+        raise HTTPException(status_code=400, detail=str(e))
+
     return {"status": "deleted", "id": integration_id}
 
 
+# ─────────────────────────────
+# Get All Integrations (Paginated)
+# ─────────────────────────────
 @router.get("/syslog_integrations", status_code=status.HTTP_200_OK)
 def get_all_integrations(
     network: Optional[str] = Query(None, description="Filter by network"),
@@ -113,19 +165,21 @@ def get_all_integrations(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=1000),
 ):
+    """Return all integrations with optional filtering, sorting, and pagination."""
     params: List[Any] = []
     where_clauses: List[str] = []
+    join_profiles = False
 
     if profile_id:
-        where_clauses.append("profile_id = %s"); params.append(profile_id)
+        where_clauses.append("i.profile_id = %s")
+        params.append(profile_id)
     if search:
-        where_clauses.append("LOWER(destination_name) LIKE %s"); params.append(f"%{search.lower()}%")
+        where_clauses.append("LOWER(i.destination_name) LIKE %s")
+        params.append(f"%{search.lower()}%")
     if network:
-        # join with profiles to filter by network
-        where_clauses.append("p.network = %s"); params.append(network)
+        where_clauses.append("p.network = %s")
+        params.append(network)
         join_profiles = True
-    else:
-        join_profiles = False
 
     where = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     offset = (page - 1) * limit
@@ -137,25 +191,33 @@ def get_all_integrations(
         ORDER BY i.destination_name ASC
         LIMIT %s OFFSET %s
     """
+
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
-        try:
-            cursor.execute(sql, tuple(params + [limit, offset]))
-            rows = cursor.fetchall() or []
-        finally:
-            cursor.close()
+        cursor.execute(sql, tuple(params + [limit, offset]))
+        rows = cursor.fetchall() or []
+        cursor.close()
+
     return {"total": len(rows), "page": page, "limit": limit, "items": rows}
 
 
-@router.get("/syslog_integrations/{integration_id}", status_code=status.HTTP_200_OK)
-def get_integration(integration_id: str, network: str = Query(...)):
-    # ensure integration exists
+# ─────────────────────────────
+# Get Single Integration
+# ─────────────────────────────
+@router.get("/syslog_integrations/single", status_code=status.HTTP_200_OK)
+def get_integration(
+    integration_id: str = Query(..., description="Integration ID"),
+    network: str = Query(..., description="Network for validation"),
+):
+    """Fetch a single integration record (query-param style)."""
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute("SELECT * FROM syslog_integration WHERE id=%s", (integration_id,))
         row = cursor.fetchone()
         cursor.close()
+
     if not row:
         raise HTTPException(status_code=404, detail="Integration not found")
+
     _validate_network_for_profile(row["profile_id"], network)
     return row

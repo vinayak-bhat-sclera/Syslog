@@ -40,6 +40,7 @@ async def on_shutdown():
             await udp_task
         except asyncio.CancelledError:
             pass
+        
 
 if __name__ == "__main__":
     # If you want to run directly: `python -m app.main`
