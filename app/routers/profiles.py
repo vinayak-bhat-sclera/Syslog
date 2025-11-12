@@ -1,11 +1,9 @@
-# app/routers/profiles.py
 import json
 import uuid
 import logging
 from typing import Dict, Optional, Any, List
 
-from fastapi import APIRouter, HTTPException, Query, status, Body  # ✅ Added Body
-
+from fastapi import APIRouter, HTTPException, Query, status, Body
 from app.db import get_db_connection
 from app.models import profiles as profile_models
 from app.services.device_cache import clear_cache, clear_profile_devices
@@ -14,9 +12,6 @@ router = APIRouter()
 logger = logging.getLogger("app.routers.profiles")
 
 
-# ─────────────────────────────
-# Helper
-# ─────────────────────────────
 def _validate_network(network: Optional[str]):
     """Ensure network param is always provided."""
     if not network:
@@ -31,10 +26,9 @@ def _validate_network(network: Optional[str]):
 # ─────────────────────────────
 @router.post("/syslog_profiles", status_code=status.HTTP_201_CREATED)
 def create_profile(
-    p: profile_models.ProfileIn = Body(...),  # ✅ Explicitly parse from JSON body
+    p: profile_models.ProfileIn = Body(...),
     network: str = Query(..., description="Network for the profile"),
 ) -> Dict[str, str]:
-    """Create a new syslog profile with optional device mappings."""
     _validate_network(network)
     pid = str(uuid.uuid4())
 
@@ -72,7 +66,7 @@ def create_profile(
             try:
                 clear_cache()
             except Exception:
-                logger.debug("clear_cache unavailable or failed; continuing")
+                logger.debug("clear_cache unavailable or failed")
 
             cursor.close()
 
@@ -84,15 +78,14 @@ def create_profile(
 
 
 # ─────────────────────────────
-# Update Profile (query-param style)
+# Update Profile
 # ─────────────────────────────
 @router.put("/syslog_profiles", response_model=Dict[str, str])
 def update_profile(
     profile_id: str = Query(..., description="Profile ID to update"),
     network: str = Query(..., description="Network of the profile (immutable but required)"),
-    p: profile_models.ProfileUpdate = Body(None),  # ✅ parse from body if present
+    p: profile_models.ProfileUpdate = Body(None),
 ):
-    """Update a syslog profile (query-param style)."""
     _validate_network(network)
 
     try:
@@ -167,14 +160,13 @@ def update_profile(
 
 
 # ─────────────────────────────
-# Delete Profile (query-param style)
+# Delete Profile
 # ─────────────────────────────
 @router.delete("/syslog_profiles", status_code=status.HTTP_200_OK)
 def delete_profile(
     profile_id: str = Query(..., description="Profile ID to delete"),
     network: str = Query(..., description="Network must match existing profile"),
 ):
-    """Delete a profile and its associated device mappings (query-param style)."""
     _validate_network(network)
 
     try:
@@ -208,13 +200,13 @@ def delete_profile(
 
 
 # ─────────────────────────────
-# Get All Profiles (Paginated, Filtered)
+# Get All Profiles
 # ─────────────────────────────
 @router.get("/syslog_profiles/all", status_code=status.HTTP_200_OK)
 def get_all_profiles(
-    network: Optional[str] = Query(None, description="Filter by network"),
-    profile_type: Optional[str] = Query(None, description="Filter by profile type (internal|external)"),
-    search: Optional[str] = Query(None, description="Substring match on profile name"),
+    network: Optional[str] = Query(None),
+    profile_type: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=1000),
 ):
@@ -226,7 +218,7 @@ def get_all_profiles(
         where_clauses.append("network = %s")
         params.append(network)
     if profile_type:
-        where_clauses.append("type = %s")
+        where_clauses.append("`type` = %s")
         params.append(profile_type)
     if search:
         where_clauses.append("LOWER(name) LIKE %s")
@@ -234,7 +226,20 @@ def get_all_profiles(
 
     where = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     offset = (page - 1) * limit
-    sql = f"SELECT * FROM syslog_profiles {where} ORDER BY name ASC LIMIT %s OFFSET %s"
+    sql = f"""
+        SELECT 
+            id, 
+            name, 
+            `type` AS profile_type, 
+            network, 
+            priorities, 
+            facilities, 
+            keywords 
+        FROM syslog_profiles 
+        {where} 
+        ORDER BY name ASC 
+        LIMIT %s OFFSET %s
+    """
 
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
@@ -246,18 +251,31 @@ def get_all_profiles(
 
 
 # ─────────────────────────────
-# Get Single Profile (query-param style)
+# Get Single Profile
 # ─────────────────────────────
 @router.get("/syslog_profiles/single", status_code=status.HTTP_200_OK)
 def get_profile(
-    profile_id: str = Query(..., description="Profile ID"),
-    network: str = Query(..., description="Network of the profile"),
+    profile_id: str = Query(...),
+    network: str = Query(...),
 ):
-    """Fetch a single profile by ID and network (query-param style)."""
     _validate_network(network)
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM syslog_profiles WHERE id=%s", (profile_id,))
+        cursor.execute(
+            """
+            SELECT 
+                id, 
+                name, 
+                `type` AS profile_type, 
+                network, 
+                priorities, 
+                facilities, 
+                keywords 
+            FROM syslog_profiles 
+            WHERE id=%s
+            """,
+            (profile_id,),
+        )
         row = cursor.fetchone()
         cursor.close()
 

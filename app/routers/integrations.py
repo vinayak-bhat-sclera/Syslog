@@ -1,10 +1,7 @@
-# app/routers/integrations.py
 import uuid
 import logging
 from typing import Dict, Optional, Any, List
-
 from fastapi import APIRouter, HTTPException, Query, status
-
 from app.db import get_db_connection
 from app.models import integrations as integ_models
 
@@ -23,15 +20,9 @@ def _validate_network_for_profile(profile_id: str, network: str):
         row = cursor.fetchone()
         cursor.close()
     if not row:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Profile not found for provided profile_id",
-        )
+        raise HTTPException(status_code=404, detail="Profile not found for provided profile_id")
     if row[0] != network:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Network mismatch for provided profile_id",
-        )
+        raise HTTPException(status_code=403, detail="Network mismatch for provided profile_id")
 
 
 # ─────────────────────────────
@@ -44,8 +35,8 @@ def create_integration(
 ) -> Dict[str, str]:
     """Create a new syslog integration destination."""
     _validate_network_for_profile(i.profile_id, network)
-
     iid = str(uuid.uuid4())
+
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor()
@@ -155,38 +146,51 @@ def delete_integration(
 
 
 # ─────────────────────────────
-# Get All Integrations (Paginated)
+# Get All Integrations (Paginated with filters)
 # ─────────────────────────────
 @router.get("/syslog_integrations", status_code=status.HTTP_200_OK)
 def get_all_integrations(
     network: Optional[str] = Query(None, description="Filter by network"),
-    profile_id: Optional[str] = Query(None, description="Filter by profile_id"),
-    search: Optional[str] = Query(None, description="Case-insensitive name search"),
+    profile_name: Optional[str] = Query(None, description="Filter by profile name (case-insensitive)"),
+    search: Optional[str] = Query(None, description="Search by destination_name (case-insensitive)"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=1000),
 ):
-    """Return all integrations with optional filtering, sorting, and pagination."""
+    """
+    Return all integrations with optional filtering:
+    - network
+    - profile_name (from linked profile)
+    - search (destination_name)
+    """
     params: List[Any] = []
     where_clauses: List[str] = []
-    join_profiles = False
 
-    if profile_id:
-        where_clauses.append("i.profile_id = %s")
-        params.append(profile_id)
+    if network:
+        where_clauses.append("i.network = %s")
+        params.append(network)
+    if profile_name:
+        where_clauses.append("LOWER(p.name) LIKE %s")
+        params.append(f"%{profile_name.lower()}%")
     if search:
         where_clauses.append("LOWER(i.destination_name) LIKE %s")
         params.append(f"%{search.lower()}%")
-    if network:
-        where_clauses.append("p.network = %s")
-        params.append(network)
-        join_profiles = True
 
     where = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     offset = (page - 1) * limit
 
     sql = f"""
-        SELECT i.* FROM syslog_integration i
-        {"JOIN syslog_profiles p ON i.profile_id = p.id" if join_profiles else ""}
+        SELECT 
+            i.id,
+            i.profile_id,
+            p.name AS profile_name,
+            p.type AS p_type,
+            i.destination_name,
+            i.ip_address,
+            i.port,
+            i.auth_token,
+            i.network
+        FROM syslog_integration i
+        JOIN syslog_profiles p ON i.profile_id = p.id
         {where}
         ORDER BY i.destination_name ASC
         LIMIT %s OFFSET %s
@@ -212,7 +216,15 @@ def get_integration(
     """Fetch a single integration record (query-param style)."""
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM syslog_integration WHERE id=%s", (integration_id,))
+        cursor.execute(
+            """
+            SELECT i.*, p.name AS profile_name, p.type AS p_type
+            FROM syslog_integration i
+            JOIN syslog_profiles p ON i.profile_id = p.id
+            WHERE i.id=%s
+            """,
+            (integration_id,),
+        )
         row = cursor.fetchone()
         cursor.close()
 

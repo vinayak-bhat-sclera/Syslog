@@ -17,7 +17,7 @@ logger = logging.getLogger("app.routers.incidents")
 @router.get("/syslog_incidents", status_code=200)
 def list_incidents(
     network: Optional[str] = Query(None, description="Filter by network (profile network association)"),
-    device_id: Optional[str] = Query(None, description="Filter by device_id"),
+    device_id: Optional[str] = Query(None, description="Filter by device_id within the network"),
     profile_id: Optional[str] = Query(None, description="Filter by profile_id"),
     priority_code: Optional[int] = Query(None, description="Filter by syslog priority code"),
     facility_code: Optional[int] = Query(None, description="Filter by syslog facility code"),
@@ -39,30 +39,43 @@ def list_incidents(
         params = []
         where = " WHERE 1=1 "
 
+        # Device-level filter
         if device_id:
-            where += " AND inc.device_id=%s"
+            where += " AND inc.device_id = %s"
             params.append(device_id)
+
+        # Profile-level filter
         if profile_id:
-            where += " AND inc.profile_id=%s"
+            where += " AND inc.profile_id = %s"
             params.append(profile_id)
+
+        # Priority code filter
         if priority_code is not None:
-            where += " AND inc.priority_code=%s"
+            where += " AND inc.priority_code = %s"
             params.append(priority_code)
+
+        # Facility code filter
         if facility_code is not None:
-            where += " AND inc.facility_code=%s"
+            where += " AND inc.facility_code = %s"
             params.append(facility_code)
+
+        # Time filters
         if since_ts:
             where += " AND inc.timestamp >= %s"
             params.append(since_ts)
         if until_ts:
             where += " AND inc.timestamp <= %s"
             params.append(until_ts)
+
+        # Network filter (via syslog_profiles join)
         if network:
             where += " AND p.network = %s"
             params.append(network)
 
+        # Pagination
         offset = (page - 1) * limit
 
+        # SQL for paginated data
         sql_items = f"""
             SELECT 
                 inc.id,
@@ -79,6 +92,7 @@ def list_incidents(
             LIMIT %s OFFSET %s
         """
 
+        # SQL for total count
         sql_count = f"""
             SELECT COUNT(1) as cnt
             FROM syslog_incidents inc
@@ -89,16 +103,16 @@ def list_incidents(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            # Count first for total pages
+            # Count total results
             cursor.execute(sql_count, tuple(params))
             total = cursor.fetchone()["cnt"]
 
-            # Fetch paginated data
+            # Fetch paginated items
             cursor.execute(sql_items, tuple(params + [limit, offset]))
             rows = cursor.fetchall() or []
             cursor.close()
 
-        # Add readable labels for priority and facility codes
+        # Enrich with readable labels
         for r in rows:
             r["priority_label"] = (
                 PRIORITY_MAP.get(r.get("priority_code"), "unknown")
