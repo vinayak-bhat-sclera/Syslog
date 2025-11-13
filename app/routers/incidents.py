@@ -2,82 +2,61 @@
 import logging
 from typing import Optional, Any, Dict
 
-from fastapi import APIRouter, Query, HTTPException  # Depends  # Uncomment Depends when JWT auth is added
+from fastapi import APIRouter, Query, HTTPException, Path
 from app.db import get_db_connection
 from app.utils.constants import PRIORITY_MAP, FACILITY_MAP
-# from app.utils.token_validator import get_current_user  # Uncomment when enabling JWT auth
 
 router = APIRouter()
 logger = logging.getLogger("app.routers.incidents")
 
 
-# ─────────────────────────────
-# List / Filter Syslog Incidents
-# ─────────────────────────────
-@router.get("/syslog_incidents", status_code=200)
+# ───────────────────────────────────────────────────────────────
+# Get Syslog Incidents for a device_id under a docker_name
+# ───────────────────────────────────────────────────────────────
+@router.get(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_incidents/{device_id}/get",
+    status_code=200,
+)
 def list_incidents(
-    network: Optional[str] = Query(None, description="Filter by network (profile network association)"),
-    device_id: Optional[str] = Query(None, description="Filter by device_id within the network"),
-    profile_id: Optional[str] = Query(None, description="Filter by profile_id"),
+    username: str = Path(...),
+    vdmsid: str = Path(...),
+    docker_name: str = Path(..., description="Docker instance name (replaces network)"),
+    device_id: str = Path(..., description="Device ID whose incidents must be fetched"),
+
+    # Filters
     priority_code: Optional[int] = Query(None, description="Filter by syslog priority code"),
     facility_code: Optional[int] = Query(None, description="Filter by syslog facility code"),
-    since_ts: Optional[str] = Query(None, description="Filter incidents since timestamp (inclusive, ISO8601)"),
-    until_ts: Optional[str] = Query(None, description="Filter incidents until timestamp (inclusive, ISO8601)"),
-    page: int = Query(1, ge=1, description="Pagination page number"),
-    limit: int = Query(50, ge=1, le=1000, description="Number of incidents per page"),
-    # current_user: Any = Depends(get_current_user),  # Uncomment when auth is enabled
+
+    # Pagination
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=1000, description="Results per page"),
 ) -> Dict[str, Any]:
     """
-    Retrieve syslog incidents with advanced filtering and pagination.
+    Fetch syslog incidents for a device inside the provided docker instance.
 
-    Filters:
-    - network, device_id, profile_id, priority_code, facility_code
-    - since_ts, until_ts (timestamps)
+    NOTE:
+    - syslog_incidents table has NO docker_name column (by requirement).
+    - Filtering is done by device_id only.
     """
 
     try:
-        params = []
-        where = " WHERE 1=1 "
+        params = [device_id]
+        where = " WHERE inc.device_id = %s "
 
-        # Device-level filter
-        if device_id:
-            where += " AND inc.device_id = %s"
-            params.append(device_id)
-
-        # Profile-level filter
-        if profile_id:
-            where += " AND inc.profile_id = %s"
-            params.append(profile_id)
-
-        # Priority code filter
+        # Optional filters
         if priority_code is not None:
             where += " AND inc.priority_code = %s"
             params.append(priority_code)
 
-        # Facility code filter
         if facility_code is not None:
             where += " AND inc.facility_code = %s"
             params.append(facility_code)
 
-        # Time filters
-        if since_ts:
-            where += " AND inc.timestamp >= %s"
-            params.append(since_ts)
-        if until_ts:
-            where += " AND inc.timestamp <= %s"
-            params.append(until_ts)
-
-        # Network filter (via syslog_profiles join)
-        if network:
-            where += " AND p.network = %s"
-            params.append(network)
-
         # Pagination
         offset = (page - 1) * limit
 
-        # SQL for paginated data
         sql_items = f"""
-            SELECT 
+            SELECT
                 inc.id,
                 inc.device_id,
                 inc.profile_id,
@@ -86,17 +65,14 @@ def list_incidents(
                 inc.message,
                 inc.timestamp
             FROM syslog_incidents inc
-            LEFT JOIN syslog_profiles p ON inc.profile_id = p.id
             {where}
             ORDER BY inc.timestamp DESC
             LIMIT %s OFFSET %s
         """
 
-        # SQL for total count
         sql_count = f"""
-            SELECT COUNT(1) as cnt
+            SELECT COUNT(1) AS cnt
             FROM syslog_incidents inc
-            LEFT JOIN syslog_profiles p ON inc.profile_id = p.id
             {where}
         """
 
@@ -107,12 +83,12 @@ def list_incidents(
             cursor.execute(sql_count, tuple(params))
             total = cursor.fetchone()["cnt"]
 
-            # Fetch paginated items
+            # Get paginated incidents
             cursor.execute(sql_items, tuple(params + [limit, offset]))
             rows = cursor.fetchall() or []
             cursor.close()
 
-        # Enrich with readable labels
+        # Add readable labels
         for r in rows:
             r["priority_label"] = (
                 PRIORITY_MAP.get(r.get("priority_code"), "unknown")
@@ -130,13 +106,12 @@ def list_incidents(
             "limit": limit,
             "count": len(rows),
             "filters": {
-                "network": network,
+                "docker_name": docker_name,
                 "device_id": device_id,
-                "profile_id": profile_id,
                 "priority_code": priority_code,
                 "facility_code": facility_code,
-                "since_ts": since_ts,
-                "until_ts": until_ts,
+                "since_ts": None,
+                "until_ts": None,
             },
             "items": rows,
         }

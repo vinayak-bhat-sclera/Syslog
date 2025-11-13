@@ -92,24 +92,30 @@ def init_db():
     with get_db_connection(settings.DB_NAME) as cnx:
         cursor = cnx.cursor()
         try:
+            # --------------------------
+            # syslog_profiles (network → docker_name)
+            # --------------------------
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS syslog_profiles (
                     id CHAR(36) PRIMARY KEY,
                     name VARCHAR(100) NOT NULL,
                     type ENUM('internal','external') NOT NULL,
-                    network VARCHAR(100),
+                    docker_name VARCHAR(100),
                     priorities JSON DEFAULT NULL,
                     facilities JSON DEFAULT NULL,
                     keywords JSON DEFAULT NULL
                 ) ENGINE=InnoDB;
                 """
             )
+
             cursor.execute("SHOW INDEX FROM syslog_profiles WHERE Key_name = %s", ("idx_syslog_profiles_type",))
             if not cursor.fetchall():
                 cursor.execute("CREATE INDEX idx_syslog_profiles_type ON syslog_profiles(type)")
 
-            # inside init_db()
+            # --------------------------
+            # syslog_integration (network → docker_name)
+            # --------------------------
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS syslog_integration (
@@ -119,13 +125,15 @@ def init_db():
                     ip_address VARCHAR(45),
                     port INT,
                     auth_token VARCHAR(255) NULL,
-                    network VARCHAR(100),
+                    docker_name VARCHAR(100),
                     FOREIGN KEY (profile_id) REFERENCES syslog_profiles(id) ON DELETE CASCADE
                 ) ENGINE=InnoDB;
-            """
-)
+                """
+            )
 
-
+            # --------------------------
+            # syslog_profile_devices
+            # --------------------------
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS syslog_profile_devices (
@@ -138,6 +146,9 @@ def init_db():
                 """
             )
 
+            # --------------------------
+            # syslog_incidents (unchanged)
+            # --------------------------
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS syslog_incidents (

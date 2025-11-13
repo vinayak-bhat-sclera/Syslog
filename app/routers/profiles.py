@@ -1,9 +1,11 @@
+# app/routers/profiles.py
 import json
 import uuid
 import logging
 from typing import Dict, Optional, Any, List
 
-from fastapi import APIRouter, HTTPException, Query, status, Body
+from fastapi import APIRouter, HTTPException, Path, Query, status, Body
+
 from app.db import get_db_connection
 from app.models import profiles as profile_models
 from app.services.device_cache import clear_cache, clear_profile_devices
@@ -12,24 +14,35 @@ router = APIRouter()
 logger = logging.getLogger("app.routers.profiles")
 
 
-def _validate_network(network: Optional[str]):
-    """Ensure network param is always provided."""
-    if not network:
+# ─────────────────────────────
+# Helper
+# ─────────────────────────────
+def _validate_docker_name(docker_name: Optional[str]):
+    """Ensure docker_name is provided in the path."""
+    if not docker_name:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="network query param is required",
+            detail="docker_name path param is required",
         )
 
 
 # ─────────────────────────────
 # Create Profile
 # ─────────────────────────────
-@router.post("/syslog_profiles", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/create",
+    status_code=status.HTTP_201_CREATED,
+)
 def create_profile(
+    username: str = Path(..., description="User name (not used by DB, for path consistency)"),
+    vdmsid: str = Path(..., description="VDMS id (not used by DB, for path consistency)"),
+    docker_name: str = Path(..., description="Docker name (used as docker_name in DB)"),
     p: profile_models.ProfileIn = Body(...),
-    network: str = Query(..., description="Network for the profile"),
 ) -> Dict[str, str]:
-    _validate_network(network)
+    """Create a new syslog profile with optional device mappings.
+    docker_name is taken from the path and stored in DB as docker_name.
+    """
+    _validate_docker_name(docker_name)
     pid = str(uuid.uuid4())
 
     if p.type == "external":
@@ -44,13 +57,14 @@ def create_profile(
             cursor = cnx.cursor()
             cursor.execute(
                 """
-                INSERT INTO syslog_profiles (id, name, type, network, priorities, facilities, keywords)
+                INSERT INTO syslog_profiles (id, name, `type`, docker_name, priorities, facilities, keywords)
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (pid, p.name, p.type, network, prio_json, fac_json, kws_json),
+                (pid, p.name, p.type, docker_name, prio_json, fac_json, kws_json),
             )
             cnx.commit()
 
+            # Assign device mappings if provided
             if p.device_ids:
                 for device_id in p.device_ids:
                     rid = str(uuid.uuid4())
@@ -63,10 +77,11 @@ def create_profile(
                     )
                 cnx.commit()
 
+            # Clear in-memory cache if available
             try:
                 clear_cache()
             except Exception:
-                logger.debug("clear_cache unavailable or failed")
+                logger.debug("clear_cache unavailable or failed; continuing")
 
             cursor.close()
 
@@ -80,13 +95,19 @@ def create_profile(
 # ─────────────────────────────
 # Update Profile
 # ─────────────────────────────
-@router.put("/syslog_profiles", response_model=Dict[str, str])
+@router.put(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/update",
+    response_model=Dict[str, str],
+)
 def update_profile(
-    profile_id: str = Query(..., description="Profile ID to update"),
-    network: str = Query(..., description="Network of the profile (immutable but required)"),
+    username: str = Path(..., description="User name (not used by DB)"),
+    vdmsid: str = Path(..., description="VDMS id (not used by DB)"),
+    docker_name: str = Path(..., description="Docker name (must match existing profile.docker_name)"),
+    profile_id: str = Path(..., description="Profile ID to update"),
     p: profile_models.ProfileUpdate = Body(None),
 ):
-    _validate_network(network)
+    """Update allowed fields for a profile. docker_name is taken from path and must match stored value."""
+    _validate_docker_name(docker_name)
 
     try:
         with get_db_connection() as cnx:
@@ -95,8 +116,10 @@ def update_profile(
             existing = cursor.fetchone()
             if not existing:
                 raise HTTPException(status_code=404, detail="Profile not found")
-            if existing["network"] != network:
-                raise HTTPException(status_code=403, detail="Network mismatch")
+
+            # Ensure docker_name matches (previously network)
+            if existing.get("docker_name") != docker_name:
+                raise HTTPException(status_code=403, detail="docker_name mismatch")
 
             preserved_type = existing["type"]
             new_name = p.name if p and p.name is not None else existing["name"]
@@ -130,6 +153,7 @@ def update_profile(
             )
             cnx.commit()
 
+            # Replace device mappings only if provided
             if p and p.device_ids is not None:
                 cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
                 for device_id in p.device_ids:
@@ -143,6 +167,7 @@ def update_profile(
                     )
                 cnx.commit()
 
+            # Clear cache for this profile (or full cache fallback)
             try:
                 clear_profile_devices(profile_id)
             except Exception:
@@ -162,22 +187,28 @@ def update_profile(
 # ─────────────────────────────
 # Delete Profile
 # ─────────────────────────────
-@router.delete("/syslog_profiles", status_code=status.HTTP_200_OK)
+@router.delete(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/delete",
+    status_code=status.HTTP_200_OK,
+)
 def delete_profile(
-    profile_id: str = Query(..., description="Profile ID to delete"),
-    network: str = Query(..., description="Network must match existing profile"),
+    username: str = Path(..., description="User name (not used by DB)"),
+    vdmsid: str = Path(..., description="VDMS id (not used by DB)"),
+    docker_name: str = Path(..., description="Docker name"),
+    profile_id: str = Path(..., description="Profile ID to delete"),
 ):
-    _validate_network(network)
+    """Delete a profile and its associated device mappings. docker_name from path must match stored value."""
+    _validate_docker_name(docker_name)
 
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
-            cursor.execute("SELECT network FROM syslog_profiles WHERE id=%s", (profile_id,))
+            cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
             row = cursor.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Profile not found")
-            if row["network"] != network:
-                raise HTTPException(status_code=403, detail="Network mismatch")
+            if row["docker_name"] != docker_name:
+                raise HTTPException(status_code=403, detail="docker_name mismatch")
 
             cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
             cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (profile_id,))
@@ -200,23 +231,34 @@ def delete_profile(
 
 
 # ─────────────────────────────
-# Get All Profiles
+# Get All Profiles (Paginated, Filtered)
 # ─────────────────────────────
-@router.get("/syslog_profiles/all", status_code=status.HTTP_200_OK)
+@router.get(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles",
+    status_code=status.HTTP_200_OK,
+)
 def get_all_profiles(
-    network: Optional[str] = Query(None),
-    profile_type: Optional[str] = Query(None),
-    search: Optional[str] = Query(None),
+    username: str = Path(..., description="User name (not used by DB)"),
+    vdmsid: str = Path(..., description="VDMS id (not used by DB)"),
+    docker_name: str = Path(..., description="Docker name to filter by"),
+    profile_type: Optional[str] = Query(None, description="Filter by profile type (internal|external)"),
+    search: Optional[str] = Query(None, description="Case-insensitive substring match on profile name"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=1000),
 ):
-    """Return paginated profiles sorted alphabetically by name."""
+    """
+    Return paginated profiles for the provided docker_name path value.
+    Optional filters: profile_type and search (profile name).
+    """
+    _validate_docker_name(docker_name)
+
     params: List[Any] = []
     where_clauses: List[str] = []
 
-    if network:
-        where_clauses.append("network = %s")
-        params.append(network)
+    # docker_name path MUST filter results
+    where_clauses.append("docker_name = %s")
+    params.append(docker_name)
+
     if profile_type:
         where_clauses.append("`type` = %s")
         params.append(profile_type)
@@ -226,18 +268,19 @@ def get_all_profiles(
 
     where = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
     offset = (page - 1) * limit
+
     sql = f"""
         SELECT 
             id, 
             name, 
             `type` AS profile_type, 
-            network, 
+            docker_name, 
             priorities, 
             facilities, 
-            keywords 
-        FROM syslog_profiles 
-        {where} 
-        ORDER BY name ASC 
+            keywords
+        FROM syslog_profiles
+        {where}
+        ORDER BY name ASC
         LIMIT %s OFFSET %s
     """
 
@@ -253,25 +296,25 @@ def get_all_profiles(
 # ─────────────────────────────
 # Get Single Profile
 # ─────────────────────────────
-@router.get("/syslog_profiles/single", status_code=status.HTTP_200_OK)
+@router.get(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/get",
+    status_code=status.HTTP_200_OK,
+)
 def get_profile(
-    profile_id: str = Query(...),
-    network: str = Query(...),
+    username: str = Path(..., description="User name (not used by DB)"),
+    vdmsid: str = Path(..., description="VDMS id (not used by DB)"),
+    docker_name: str = Path(..., description="Docker name"),
+    profile_id: str = Path(..., description="Profile ID"),
 ):
-    _validate_network(network)
+    """Fetch a single profile by ID and docker_name (path)."""
+    _validate_docker_name(docker_name)
+
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT 
-                id, 
-                name, 
-                `type` AS profile_type, 
-                network, 
-                priorities, 
-                facilities, 
-                keywords 
-            FROM syslog_profiles 
+            SELECT id, name, `type` AS profile_type, docker_name, priorities, facilities, keywords
+            FROM syslog_profiles
             WHERE id=%s
             """,
             (profile_id,),
@@ -281,7 +324,7 @@ def get_profile(
 
     if not row:
         raise HTTPException(status_code=404, detail="Profile not found")
-    if row["network"] != network:
-        raise HTTPException(status_code=403, detail="Network mismatch")
+    if row["docker_name"] != docker_name:
+        raise HTTPException(status_code=403, detail="docker_name mismatch")
 
     return row
