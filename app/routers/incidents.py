@@ -14,7 +14,7 @@ logger = logging.getLogger("app.routers.incidents")
 # Get Syslog Incidents for a device_id under a docker_name
 # ───────────────────────────────────────────────────────────────
 @router.get(
-    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_incidents/{device_id}/get",
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_incidents/{device_id}/incidents",
     status_code=200,
 )
 def list_incidents(

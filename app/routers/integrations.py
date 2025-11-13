@@ -237,7 +237,7 @@ def get_all_integrations(
 # Get Single Integration
 # ─────────────────────────────
 @router.get(
-    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_integrations/{integration_id}/get",
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_integrations/{integration_id}",
     status_code=status.HTTP_200_OK,
 )
 def get_integration(
