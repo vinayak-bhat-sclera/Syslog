@@ -1,8 +1,7 @@
-# app/services/device_cache.py
 import asyncio
 import time
 import logging
-from typing import Optional, Dict, Tuple, List, Any
+from typing import Optional, Dict, Tuple, List, Any, Set
 
 import aiohttp
 
@@ -15,6 +14,9 @@ _DEVICE_CACHE: Dict[str, Tuple[str, int]] = {}
 _CACHE_LOCK = asyncio.Lock()
 CACHE_TTL = getattr(settings, "CACHE_TTL", 3600)  # seconds
 
+# Track last-known device_ids per profile to detect removed device_ids on update/delete
+_PROFILE_DEVICE_MAP: Dict[str, Set[str]] = {}
+
 # Background control
 _BACKGROUND_TASK: Optional[asyncio.Task] = None
 _REFRESH_INTERVAL_SECONDS = getattr(settings, "CACHE_REFRESH_INTERVAL_SECONDS", 3600)  # hourly
@@ -25,7 +27,7 @@ async def _fetch_from_springboot(ip: str) -> Optional[str]:
     """
     Async request to Spring Boot to resolve ip -> device_id.
     Expects Spring Boot endpoint that returns JSON { "device_id": "..." }.
-    (unchanged legacy behavior)
+    (legacy fallback behavior — still present)
     """
     url = f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}/api/device/by-ip/{ip}"
     try:
@@ -62,7 +64,7 @@ async def get_device_id(ip: str) -> Optional[str]:
                 # expired
                 _DEVICE_CACHE.pop(ip, None)
 
-    # cache miss -> call springboot by-ip (legacy)
+    # cache miss -> call springboot by-ip (legacy fallback)
     device_id = await _fetch_from_springboot(ip)
     if device_id:
         async with _CACHE_LOCK:
@@ -95,16 +97,31 @@ async def clear_cache() -> None:
     logger.warning("Device cache flushed (in-memory).")
 
 
+async def _evict_by_device_ids(device_ids: List[str]) -> None:
+    """Evict any cache entries whose device_id is in device_ids (internal helper)."""
+    if not device_ids:
+        return
+    ids_set = set(device_ids)
+    async with _CACHE_LOCK:
+        to_remove: List[str] = []
+        for ip, (did, _) in list(_DEVICE_CACHE.items()):
+            if did in ids_set:
+                to_remove.append(ip)
+        for ip in to_remove:
+            _DEVICE_CACHE.pop(ip, None)
+            logger.debug("[DEVICE_CACHE EVICT - BY_DEVICE_IDS] evicted %s (device_id in provided list)", ip)
+
+
 async def clear_profile_devices(profile_id: str) -> None:
     """
     Remove cached entries that belong to mappings in profile_id.
-    This function is used after profile update/delete to evict any ip entries associated with mappings.
-    It checks DB to find device_ids for that profile and evicts entries whose device_id matches.
+    It looks up device_ids for that profile in the DB and evicts any cache entries where device_id matches.
+    Also updates the in-memory profile->device_id map.
     """
     # Lazy import to avoid cycle
     from app.db import get_db_connection
 
-    device_ids = []
+    device_ids: List[str] = []
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
@@ -121,49 +138,62 @@ async def clear_profile_devices(profile_id: str) -> None:
     except Exception:
         logger.exception("Error loading profile device_ids for cache eviction")
 
-    # Evict any cache entries where value == device_id
-    async with _CACHE_LOCK:
-        to_remove: List[str] = []
-        for ip, (did, _) in list(_DEVICE_CACHE.items()):
-            if did in device_ids:
-                to_remove.append(ip)
-        for ip in to_remove:
-            _DEVICE_CACHE.pop(ip, None)
-            logger.debug("Evicted cached ip %s for profile %s", ip, profile_id)
+    # Evict entries whose device_id is in device_ids
+    await _evict_by_device_ids(device_ids)
+
+    # Update the profile-device map to the current set (may be empty)
+    _PROFILE_DEVICE_MAP[profile_id] = set(device_ids)
 
 
 # ----------------------------
 # SpringBoot mapping fetchers
 # ----------------------------
-async def _fetch_mappings_from_springboot_for_device_ids(device_ids: List[str]) -> Dict[str, str]:
+async def _fetch_mappings_from_springboot_for_device_ids(device_ids: List[str], docker_name: Optional[str] = None) -> Dict[str, str]:
     """
     Primary method to fetch device_id -> ip mappings for a list of device_ids from Spring Boot.
 
-    Expected POST:
-      POST /api/device/mappings
-      { "device_ids": ["id1","id2", ...] }
+    Expected request (real service):
+      POST /docker/{docker_name}/getdevicedetailsbyids?pageno=1&pagesize=100
+      BODY: ["id1","id2",...]
 
-    Expected response:
-      { "mappings": [ {"device_id": "...", "ip_address": "..." }, ... ] }
+    Expected response (real service returns list of objects):
+      [ {"id":"<device_id>", "ip_address":"<ip>", ...}, ... ]
 
-    Returns dict: ip -> device_id
+    This function returns dict: ip -> device_id
     """
     if not device_ids:
         return {}
 
     base = f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}"
-    url = f"{base}/api/device/mappings"
+    # Use the docker_name path if provided; otherwise fall back to generic mapping endpoint
+    if docker_name:
+        url = f"{base}/docker/{docker_name}/getdevicedetailsbyids?pageno=1&pagesize=100"
+    else:
+        # fallback if caller didn't supply docker_name (defensive)
+        url = f"{base}/api/device/mappings"
+
     result: Dict[str, str] = {}
 
     try:
-        timeout = aiohttp.ClientTimeout(total=6)
+        timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json={"device_ids": device_ids}) as resp:
+            # The real service expects a JSON array body (as in your curl) — send the array.
+            async with session.post(url, json=device_ids) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    mappings = data.get("mappings") or data.get("data") or []
-                    for m in mappings:
-                        device_id = m.get("device_id") or m.get("deviceId") or m.get("id")
+                    # real service returns a list (not wrapped), or sometimes a wrapper -> handle both
+                    mappings_raw = []
+                    if isinstance(data, list):
+                        mappings_raw = data
+                    elif isinstance(data, dict):
+                        # try common keys
+                        mappings_raw = data.get("devices") or data.get("mappings") or data.get("data") or []
+                    else:
+                        mappings_raw = []
+
+                    for m in mappings_raw:
+                        # real response uses "id" and "ip_address"
+                        device_id = m.get("id") or m.get("device_id") or m.get("deviceId")
                         ip = m.get("ip_address") or m.get("ip") or m.get("ipAddress")
                         if device_id and ip:
                             result[ip] = device_id
@@ -180,33 +210,39 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
     """
     Refresh cache for a single profile:
     - read device_ids from DB for profile
-    - ask Spring Boot for device_id->ip pairs (single POST)
-    - populate cache entries
+    - ask Spring Boot for device_id->ip pairs for that profile's docker_name
+    - populate cache entries and update profile->device map
     """
     from app.db import get_db_connection
 
-    # Clear previous entries for that profile first
-    await clear_profile_devices(profile_id)
-
-    # collect device_ids for this profile
+    # collect device_ids and docker_name for this profile
     device_ids: List[str] = []
+    docker_name: Optional[str] = None
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
             cursor.execute("SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
             rows = cursor.fetchall() or []
-            cursor.close()
             device_ids = [r["device_id"] for r in rows if r.get("device_id")]
+            cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
+            p = cursor.fetchone()
+            cursor.close()
+            if p:
+                docker_name = p.get("docker_name")
     except Exception:
-        logger.exception("Error fetching profile devices for refresh for profile %s", profile_id)
+        logger.exception("Error fetching profile devices or docker_name for refresh for profile %s", profile_id)
         return
+
+    # Update the profile-device map before doing external calls (so notify/evict logic has previous state)
+    prev_set = _PROFILE_DEVICE_MAP.get(profile_id, set())
+    _PROFILE_DEVICE_MAP[profile_id] = set(device_ids)
 
     if not device_ids:
         logger.info("No device_ids found for profile %s; nothing to refresh", profile_id)
         return
 
     # fetch mappings
-    mappings = await _fetch_mappings_from_springboot_for_device_ids(device_ids)
+    mappings = await _fetch_mappings_from_springboot_for_device_ids(device_ids, docker_name=docker_name)
     if not mappings:
         logger.info("No mappings returned from springboot for profile %s", profile_id)
         return
@@ -222,43 +258,62 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
 async def refresh_all_profiles_cache() -> None:
     """
     Refresh mappings for all profiles:
-    - load all device_ids from DB (grouped)
-    - call Spring Boot in batches (to limit request sizes)
-    - populate cache
+    - load profile->device_ids mapping from DB
+    - for each profile call Spring Boot and update cache and profile map
     """
     from app.db import get_db_connection
 
-    # Build full device_id set from DB
-    all_device_ids: List[str] = []
+    # Build map: profile_id -> list(device_id)
+    profile_to_device_ids: Dict[str, List[str]] = {}
+    profile_to_docker: Dict[str, Optional[str]] = {}
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
-            cursor.execute("SELECT DISTINCT pd.device_id AS device_id FROM syslog_profile_devices pd")
+            cursor.execute(
+                """
+                SELECT pd.profile_id AS profile_id, pd.device_id AS device_id
+                FROM syslog_profile_devices pd
+                """
+            )
             rows = cursor.fetchall() or []
+            for r in rows:
+                pid = r.get("profile_id")
+                did = r.get("device_id")
+                if pid and did:
+                    profile_to_device_ids.setdefault(pid, []).append(did)
+            # fetch docker_name per profile
+            cursor.execute("SELECT id, docker_name FROM syslog_profiles")
+            rows2 = cursor.fetchall() or []
+            for r in rows2:
+                pid = r.get("id")
+                docker_name = r.get("docker_name")
+                profile_to_docker[pid] = docker_name
             cursor.close()
-            all_device_ids = [r["device_id"] for r in rows if r.get("device_id")]
     except Exception:
-        logger.exception("Error fetching all profile device_ids for full refresh")
+        logger.exception("Error fetching profile device list for full refresh")
         return
 
-    if not all_device_ids:
+    if not profile_to_device_ids:
         logger.info("No device_ids present in DB; skipping full cache refresh")
         return
 
-    # call Spring Boot in reasonable batches (e.g. 200 ids per call) to avoid huge payloads
-    batch_size = 200
+    # iterate each profile and refresh its mappings
     now = int(time.time())
     try:
-        for i in range(0, len(all_device_ids), batch_size):
-            batch = all_device_ids[i : i + batch_size]
-            mappings = await _fetch_mappings_from_springboot_for_device_ids(batch)
+        for profile_id, device_ids in profile_to_device_ids.items():
+            docker_name = profile_to_docker.get(profile_id)
+            # update profile map
+            _PROFILE_DEVICE_MAP[profile_id] = set(device_ids)
+            if not device_ids:
+                continue
+            mappings = await _fetch_mappings_from_springboot_for_device_ids(device_ids, docker_name=docker_name)
             if not mappings:
-                logger.debug("No mappings returned for batch starting at %d", i)
+                logger.debug("No mappings returned for profile %s during full refresh", profile_id)
                 continue
             async with _CACHE_LOCK:
                 for ip, did in mappings.items():
                     _DEVICE_CACHE[ip] = (did, now + CACHE_TTL)
-                    logger.info("[DEVICE_CACHE REFRESH - ALL] %s -> %s (ttl=%ds)", ip, did, CACHE_TTL)
+                    logger.info("[DEVICE_CACHE REFRESH - ALL] %s -> %s (profile=%s ttl=%ds)", ip, did, profile_id, CACHE_TTL)
     except Exception:
         logger.exception("Full cache refresh failed")
 
@@ -268,22 +323,18 @@ def get_cache_snapshot() -> Dict[str, str]:
     Return a copy of the current cache mapping ip -> device_id (ignores expiry).
     This is synchronous and intended for debug logging (safe copy done under lock with asyncio.run if needed).
     """
-    # This function is synchronous to allow quick call from sync contexts.
-    # We'll create an event loop to acquire the lock safely in most runtime contexts.
-    # But if called from within an async context, callers should use the async version below.
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
 
     if loop and loop.is_running():
-        # we're in async context; create coro to return snapshot
-        async def _snap():
-            async with _CACHE_LOCK:
-                return {ip: did for ip, (did, _) in _DEVICE_CACHE.items()}
-        return loop.run_until_complete(_snap())  # safe when loop running? run_until_complete would fail in running loop
+        # if called from running loop, create coroutine and run it appropriately
+        # NOTE: run_until_complete cannot be called when loop is running; callers inside async should use get_cache_snapshot_async
+        # For safety here, return an empty dict if called incorrectly.
+        logger.debug("get_cache_snapshot called from running loop — use get_cache_snapshot_async instead")
+        return {}
     else:
-        # not running loop: create temporary loop
         async def _snap2():
             async with _CACHE_LOCK:
                 return {ip: did for ip, (did, _) in _DEVICE_CACHE.items()}
@@ -302,14 +353,40 @@ async def get_cache_snapshot_async() -> Dict[str, str]:
 async def notify_profile_change(profile_id: str) -> None:
     """
     Called when profile is created/updated/deleted.
-    This will evict previous cache entries for that profile and fetch fresh mappings from Spring Boot.
+    This will:
+     - determine device_ids removed since last-known state and evict any cache entries for them
+     - evict and refresh cache entries for the profile (fresh fetch)
     """
     try:
         logger.info("Profile change notified for %s: evicting & refreshing cache entries", profile_id)
-        # evict cached entries for profile
+
+        # fetch current device_ids from DB
+        from app.db import get_db_connection
+        current_device_ids: Set[str] = set()
+        try:
+            with get_db_connection() as cnx:
+                cursor = cnx.cursor(dictionary=True)
+                cursor.execute("SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
+                rows = cursor.fetchall() or []
+                cursor.close()
+                current_device_ids = {r["device_id"] for r in rows if r.get("device_id")}
+        except Exception:
+            logger.exception("Error fetching current device_ids for notify_profile_change %s", profile_id)
+
+        prev_device_ids = _PROFILE_DEVICE_MAP.get(profile_id, set())
+
+        # device_ids removed by the update/delete = prev - current
+        removed = list(prev_device_ids - current_device_ids)
+        if removed:
+            logger.info("Evicting %d device_ids removed from profile %s", len(removed), profile_id)
+            await _evict_by_device_ids(removed)
+
+        # now clear any profile-specific entries (and update the profile map)
         await clear_profile_devices(profile_id)
-        # refresh only that profile mappings
+
+        # refresh profile mappings
         await refresh_cache_for_profile(profile_id)
+
     except Exception:
         logger.exception("notify_profile_change failed for profile %s", profile_id)
 
@@ -350,8 +427,7 @@ async def _background_refresh_loop():
                 except Exception:
                     logger.exception("Scheduled full cache refresh failed")
 
-            # sleep small increments to allow graceful cancellation
-            # sleep for SNAPSHOT_INTERVAL_SECONDS (we already did snapshot work)
+            # sleep for the snapshot interval (small increments)
             await asyncio.sleep(_SNAPSHOT_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         logger.info("Device cache background task cancelled")
