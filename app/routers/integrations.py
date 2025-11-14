@@ -91,7 +91,7 @@ def update_integration(
 ):
     """Update existing integration; ensure docker_name matches linked profile."""
 
-    # Fetch existing integration → get profile_id
+    # Fetch existing integration → get old profile_id
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (integration_id,))
@@ -101,8 +101,11 @@ def update_integration(
     if not existing:
         raise HTTPException(status_code=404, detail="Integration not found")
 
-    # Validate profile's docker_name matches request docker_name
+    # Validate OLD profile_id matches docker_name
     _validate_docker_name_for_profile(existing["profile_id"], docker_name)
+
+    # Validate NEW profile_id also matches docker_name  ❗ FIX ADDED
+    _validate_docker_name_for_profile(i.profile_id, docker_name)
 
     # Perform update
     try:
@@ -175,7 +178,7 @@ def delete_integration(
 
 
 # ─────────────────────────────
-# Get All Integrations (UPDATED: page/limit coercion)
+# Get All Integrations
 # ─────────────────────────────
 @router.get(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_integrations",

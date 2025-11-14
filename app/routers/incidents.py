@@ -23,18 +23,41 @@ def list_incidents(
     docker_name: str = Path(..., description="Docker instance name"),
     device_id: str = Path(..., description="Device ID whose incidents must be fetched"),
 
-    # Filters become ANY → we convert manually
     priority_code: Optional[Any] = Query(None, description="Filter by syslog priority"),
     facility_code: Optional[Any] = Query(None, description="Filter by syslog facility"),
 
-    # Pagination (string → int)
     page: Any = Query(1, description="Page number"),
     limit: Any = Query(10, description="Limit per page"),
 ) -> Dict[str, Any]:
 
-    # -------------------------------
+    # Validate device_id belongs to this docker_name  ❗ NEW
+    try:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT p.docker_name
+                FROM syslog_profile_devices pd
+                JOIN syslog_profiles p ON p.id = pd.profile_id
+                WHERE pd.device_id = %s
+                """,
+                (device_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Device not found in any profile")
+
+        if row["docker_name"] != docker_name:
+            raise HTTPException(status_code=403, detail="docker_name mismatch for device_id")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("docker_name validation failed: %s", e)
+        raise HTTPException(status_code=500, detail="Error validating docker_name")
+
     # Convert page, limit to int
-    # -------------------------------
     try:
         page = int(page)
         limit = int(limit)
@@ -44,18 +67,8 @@ def list_incidents(
     if page < 1 or limit < 1:
         raise HTTPException(status_code=422, detail="page and limit must be >= 1")
 
-    # -------------------------------
-    # Convert filters to integers
-    # -------------------------------
+    # Convert filters to int
     def convert_optional_int(value):
-        """
-        Handles values like:
-        - None → None
-        - "" → None
-        - " " → None
-        - "3" → 3
-        - "abc" → error
-        """
         if value is None:
             return None
         if isinstance(value, str) and value.strip() == "":
@@ -116,16 +129,9 @@ def list_incidents(
             rows = cursor.fetchall() or []
             cursor.close()
 
-        # Label mapping
         for r in rows:
-            r["priority_label"] = (
-                PRIORITY_MAP.get(r.get("priority_code"), "unknown")
-                if r.get("priority_code") is not None else None
-            )
-            r["facility_label"] = (
-                FACILITY_MAP.get(r.get("facility_code"), "unknown")
-                if r.get("facility_code") is not None else None
-            )
+            r["priority_label"] = PRIORITY_MAP.get(r.get("priority_code"), "unknown")
+            r["facility_label"] = FACILITY_MAP.get(r.get("facility_code"), "unknown")
 
         return {
             "status": "success",
@@ -146,7 +152,6 @@ def list_incidents(
 
     except HTTPException:
         raise
-
     except Exception as e:
         logger.exception("list_incidents failed: %s", e)
         raise HTTPException(status_code=500, detail="DB error fetching syslog incidents")
