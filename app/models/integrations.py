@@ -10,10 +10,22 @@ class IntegrationIn(BaseModel):
     port: int = Field(..., description="Destination port number")
     auth_token: Optional[str] = Field(None, description="Optional auth token (required for Splunk)")
 
+    # Normalize destination_name and ip_address
+    @validator("destination_name")
+    def normalize_destination_name(cls, v):
+        if v is None:
+            return v
+        return v.strip().lower()
+
+    @validator("ip_address")
+    def normalize_ip(cls, v):
+        return v.strip()
+
+    # Validate Splunk requires token
     @validator("auth_token", always=True)
     def require_token_for_splunk(cls, v: Optional[str], values: Dict[str, Any]) -> Optional[str]:
-        name = (values.get("destination_name") or "").lower()
-        if name == "splunk" and not v:
+        dest = (values.get("destination_name") or "").lower()
+        if dest == "splunk" and not v:
             raise ValueError("auth_token is required for Splunk integrations")
         return v
 

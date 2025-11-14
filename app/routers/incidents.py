@@ -20,30 +20,61 @@ logger = logging.getLogger("app.routers.incidents")
 def list_incidents(
     username: str = Path(...),
     vdmsid: str = Path(...),
-    docker_name: str = Path(..., description="Docker instance name (replaces network)"),
+    docker_name: str = Path(..., description="Docker instance name"),
     device_id: str = Path(..., description="Device ID whose incidents must be fetched"),
 
-    # Filters
-    priority_code: Optional[int] = Query(None, description="Filter by syslog priority code"),
-    facility_code: Optional[int] = Query(None, description="Filter by syslog facility code"),
+    # Filters become ANY → we convert manually
+    priority_code: Optional[Any] = Query(None, description="Filter by syslog priority"),
+    facility_code: Optional[Any] = Query(None, description="Filter by syslog facility"),
 
-    # Pagination
-    page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(10, ge=1, le=1000, description="Results per page"),
+    # Pagination (string → int)
+    page: Any = Query(1, description="Page number"),
+    limit: Any = Query(10, description="Limit per page"),
 ) -> Dict[str, Any]:
-    """
-    Fetch syslog incidents for a device inside the provided docker instance.
 
-    NOTE:
-    - syslog_incidents table has NO docker_name column (by requirement).
-    - Filtering is done by device_id only.
-    """
+    # -------------------------------
+    # Convert page, limit to int
+    # -------------------------------
+    try:
+        page = int(page)
+        limit = int(limit)
+    except Exception:
+        raise HTTPException(status_code=422, detail="page and limit must be integers")
+
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=422, detail="page and limit must be >= 1")
+
+    # -------------------------------
+    # Convert filters to integers
+    # -------------------------------
+    def convert_optional_int(value):
+        """
+        Handles values like:
+        - None → None
+        - "" → None
+        - " " → None
+        - "3" → 3
+        - "abc" → error
+        """
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        try:
+            return int(value)
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail="priority_code and facility_code must be integers",
+            )
+
+    priority_code = convert_optional_int(priority_code)
+    facility_code = convert_optional_int(facility_code)
 
     try:
         params = [device_id]
         where = " WHERE inc.device_id = %s "
 
-        # Optional filters
         if priority_code is not None:
             where += " AND inc.priority_code = %s"
             params.append(priority_code)
@@ -52,7 +83,6 @@ def list_incidents(
             where += " AND inc.facility_code = %s"
             params.append(facility_code)
 
-        # Pagination
         offset = (page - 1) * limit
 
         sql_items = f"""
@@ -79,16 +109,14 @@ def list_incidents(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            # Count total results
             cursor.execute(sql_count, tuple(params))
             total = cursor.fetchone()["cnt"]
 
-            # Get paginated incidents
             cursor.execute(sql_items, tuple(params + [limit, offset]))
             rows = cursor.fetchall() or []
             cursor.close()
 
-        # Add readable labels
+        # Label mapping
         for r in rows:
             r["priority_label"] = (
                 PRIORITY_MAP.get(r.get("priority_code"), "unknown")
@@ -115,6 +143,9 @@ def list_incidents(
             },
             "items": rows,
         }
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         logger.exception("list_incidents failed: %s", e)

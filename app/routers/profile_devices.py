@@ -22,13 +22,24 @@ def get_all_device_ids(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    page: int = Query(1, ge=1),
-    limit: int = Query(100, ge=1, le=5000),
+    page: Any = Query(1, description="Page number (int or str)"),
+    limit: Any = Query(100, description="Limit (int or str)"),
 ):
     """
     Fetch all device_ids associated with ANY profile inside a given docker_name.
     NOTE: This API does NOT use profile_type filter anymore.
+    Accepts page & limit as strings and converts them to integers.
     """
+
+    # Ensure page & limit are integers
+    try:
+        page = int(page)
+        limit = int(limit)
+    except Exception:
+        raise HTTPException(status_code=422, detail="page and limit must be integers")
+
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=422, detail="page and limit must be >= 1")
 
     offset = (page - 1) * limit
 
@@ -83,7 +94,7 @@ def get_devices_by_profile(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            # Validate docker_name matches profile
+            # Validate docker_name matches the profile
             cursor.execute(
                 "SELECT docker_name FROM syslog_profiles WHERE id=%s",
                 (profile_id,),
@@ -96,12 +107,13 @@ def get_devices_by_profile(
             if row["docker_name"] != docker_name:
                 raise HTTPException(status_code=403, detail="docker_name mismatch")
 
-            # Fetch devices
+            # Fetch devices under this profile
             cursor.execute(
                 "SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s",
                 (profile_id,),
             )
             devices = [r["device_id"] for r in cursor.fetchall() or []]
+
             cursor.close()
 
     except HTTPException:
@@ -118,3 +130,4 @@ def get_devices_by_profile(
         "count": len(devices),
         "device_ids": devices,
     }
+

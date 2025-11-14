@@ -89,9 +89,9 @@ def update_integration(
     integration_id: str = Path(...),
     i: integ_models.IntegrationIn = Body(...),
 ):
-    """Update an existing integration. docker_name must match profile's stored docker_name."""
+    """Update existing integration; ensure docker_name matches linked profile."""
 
-    # Step 1: Fetch profile_id from integration
+    # Fetch existing integration → get profile_id
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (integration_id,))
@@ -101,10 +101,10 @@ def update_integration(
     if not existing:
         raise HTTPException(status_code=404, detail="Integration not found")
 
-    # Step 2: Ensure docker_name matches the linked profile's docker_name
+    # Validate profile's docker_name matches request docker_name
     _validate_docker_name_for_profile(existing["profile_id"], docker_name)
 
-    # Step 3: Perform the update
+    # Perform update
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor()
@@ -148,7 +148,6 @@ def delete_integration(
     docker_name: str = Path(...),
     integration_id: str = Path(...),
 ):
-    """Delete integration. docker_name must match."""
 
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
@@ -176,7 +175,7 @@ def delete_integration(
 
 
 # ─────────────────────────────
-# Get All Integrations
+# Get All Integrations (UPDATED: page/limit coercion)
 # ─────────────────────────────
 @router.get(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_integrations",
@@ -186,14 +185,25 @@ def get_all_integrations(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    profile_name: Optional[str] = Query(None, description="Filter by profile name (case-insensitive)"),
-    search: Optional[str] = Query(None, description="Search by destination_name (case-insensitive)"),
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=1000),
+    profile_name: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    page: Any = Query(1, description="Page number (int or string)"),
+    limit: Any = Query(50, description="Limit (int or string)"),
 ):
-    params: List[Any] = []
+    """Return paginated integrations with safe int conversion for page/limit."""
+
+    # Convert page & limit to integers
+    try:
+        page = int(page)
+        limit = int(limit)
+    except Exception:
+        raise HTTPException(status_code=422, detail="page and limit must be integers")
+
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=422, detail="page and limit must be >= 1")
+
+    params: List[Any] = [docker_name]
     where_clauses: List[str] = ["i.docker_name = %s"]
-    params.append(docker_name)
 
     if profile_name:
         where_clauses.append("LOWER(p.name) LIKE %s")
@@ -203,8 +213,8 @@ def get_all_integrations(
         where_clauses.append("LOWER(i.destination_name) LIKE %s")
         params.append(f"%{search.lower()}%")
 
-    where = "WHERE " + " AND ".join(where_clauses)
     offset = (page - 1) * limit
+    where = "WHERE " + " AND ".join(where_clauses)
 
     sql = f"""
         SELECT 
@@ -246,7 +256,6 @@ def get_integration(
     docker_name: str = Path(...),
     integration_id: str = Path(...),
 ):
-    """Fetch a single integration record."""
 
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
