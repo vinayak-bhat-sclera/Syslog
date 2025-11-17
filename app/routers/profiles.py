@@ -185,53 +185,174 @@ async def update_profile(
     return {"status": "updated", "id": profile_id}
 
 
+# # ─────────────────────────────
+# # DELETE PROFILE
+# # ─────────────────────────────
+# @router.delete(
+#     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/delete",
+#     status_code=status.HTTP_200_OK,
+# )
+# async def delete_profile(
+#     username: str = Path(...),
+#     vdmsid: str = Path(...),
+#     docker_name: str = Path(...),
+#     profile_id: str = Path(...),
+# ):
+#     """
+#     Delete profile. docker_name compared EXACTLY.
+#     """
+#     _validate_docker_name(docker_name)
+
+#     try:
+#         with get_db_connection() as cnx:
+#             cursor = cnx.cursor(dictionary=True)
+
+#             cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
+#             row = cursor.fetchone()
+
+#             if not row:
+#                 raise HTTPException(status_code=404, detail="Profile not found")
+
+#             # Exact match only
+#             if row["docker_name"] != docker_name:
+#                 raise HTTPException(status_code=403, detail="docker_name mismatch")
+
+#             cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
+#             cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (profile_id,))
+#             cnx.commit()
+
+#             cursor.close()
+
+#         asyncio.create_task(notify_profile_change(profile_id))
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.exception("delete_profile failed")
+#         raise HTTPException(status_code=400, detail=str(e))
+
+#     return {"status": "deleted", "id": profile_id}
+
+
 # ─────────────────────────────
-# DELETE PROFILE
+# DELETE MULTIPLE / SINGLE PROFILES
 # ─────────────────────────────
-@router.delete(
-    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/delete",
+@router.post(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/delete",
     status_code=status.HTTP_200_OK,
 )
-async def delete_profile(
+async def delete_profiles(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    profile_id: str = Path(...),
+    body: Dict[str, List[str]] = Body(..., example={"ids": ["id1", "id2"]}),
 ):
     """
-    Delete profile. docker_name compared EXACTLY.
+    Delete one OR multiple profiles.
+    Body: { "ids": ["id1", "id2", ...] }
+    Ensures:
+        - docker_name must match
+        - integrations linked to the profile are deleted
+        - profile_devices are deleted
+        - profile is deleted
+        - cache refresh is triggered
     """
-    _validate_docker_name(docker_name)
+    ids = body.get("ids")
+    if not ids or not isinstance(ids, list):
+        raise HTTPException(status_code=422, detail="Body must contain 'ids' list")
+
+    deleted = []
 
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
-            row = cursor.fetchone()
+            for pid in ids:
+                # validate profile exists
+                cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (pid,))
+                row = cursor.fetchone()
+                if not row:
+                    continue  # silently skip invalid IDs
 
-            if not row:
-                raise HTTPException(status_code=404, detail="Profile not found")
+                # check docker_name matches EXACTLY
+                if row["docker_name"] != docker_name:
+                    continue  # skip IDs not belonging to this docker
 
-            # Exact match only
-            if row["docker_name"] != docker_name:
-                raise HTTPException(status_code=403, detail="docker_name mismatch")
+                # Delete integrations
+                cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
 
-            cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
-            cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (profile_id,))
+                # Delete devices
+                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+
+                # Delete profile
+                cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
+                deleted.append(pid)
+
             cnx.commit()
-
             cursor.close()
 
-        asyncio.create_task(notify_profile_change(profile_id))
+        # trigger cache updates for each profile
+        for pid in deleted:
+            asyncio.create_task(notify_profile_change(pid))
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.exception("delete_profile failed")
+        logger.exception("delete_profiles failed")
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {"status": "deleted", "id": profile_id}
+    return {"status": "deleted", "deleted_ids": deleted, "count": len(deleted)}
+
+# ─────────────────────────────
+# DELETE ALL PROFILES FOR A DOCKER
+# ─────────────────────────────
+@router.delete(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/delete/all",
+    status_code=status.HTTP_200_OK,
+)
+async def delete_all_profiles(
+    username: str = Path(...),
+    vdmsid: str = Path(...),
+    docker_name: str = Path(...),
+):
+    """
+    Deletes ALL profiles (and their devices + integrations) belonging to the given docker_name.
+    """
+    deleted_ids = []
+
+    try:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(dictionary=True)
+
+            # Get all profiles under docker
+            cursor.execute("SELECT id FROM syslog_profiles WHERE docker_name=%s", (docker_name,))
+            rows = cursor.fetchall() or []
+
+            profile_ids = [r["id"] for r in rows]
+
+            for pid in profile_ids:
+                # Delete integrations
+                cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
+
+                # Delete device links
+                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+
+                # Delete profile
+                cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
+
+                deleted_ids.append(pid)
+
+            cnx.commit()
+            cursor.close()
+
+        # notify cache for each deleted id
+        for pid in deleted_ids:
+            asyncio.create_task(notify_profile_change(pid))
+
+    except Exception as e:
+        logger.exception("delete_all_profiles failed")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"status": "deleted_all", "count": len(deleted_ids), "deleted_ids": deleted_ids}
+
 
 
 # ─────────────────────────────

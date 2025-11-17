@@ -6,6 +6,7 @@ from typing import Optional, Dict, Tuple, List, Set
 import aiohttp
 
 from app.config import settings
+from app.db import get_db_connection 
 
 logger = logging.getLogger("app.services.device_cache")
 
@@ -96,7 +97,7 @@ async def _evict_by_device_ids(device_ids: List[str]) -> None:
 
 
 async def clear_profile_devices(profile_id: str) -> None:
-    from app.db import get_db_connection
+    #from app.db import get_db_connection
 
     device_ids = []
     try:
@@ -162,7 +163,7 @@ async def _fetch_mappings_from_springboot_for_device_ids(device_ids: List[str], 
 
 
 async def refresh_cache_for_profile(profile_id: str) -> None:
-    from app.db import get_db_connection
+    #from app.db import get_db_connection
 
     device_ids = []
     docker_name = None
@@ -201,7 +202,7 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
 
 
 async def refresh_all_profiles_cache() -> None:
-    from app.db import get_db_connection
+    #from app.db import get_db_connection
 
     profile_to_device_ids = {}
     profile_to_docker = {}
@@ -279,7 +280,7 @@ async def notify_profile_change(profile_id: str) -> None:
     try:
         logger.info("Profile change notified for %s: evicting & refreshing cache entries", profile_id)
 
-        from app.db import get_db_connection
+        #from app.db import get_db_connection
         current_device_ids = set()
         try:
             with get_db_connection() as cnx:
