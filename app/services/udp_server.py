@@ -57,7 +57,6 @@ async def start_udp_server():
 
     class SyslogProtocol(asyncio.DatagramProtocol):
         def datagram_received(self, data: bytes, addr: Tuple[str, int]):
-            # spawn a task to process; keep datagram receive fast
             asyncio.create_task(self.handle_message(data, addr))
 
         async def handle_message(self, data: bytes, addr: Tuple[str, int]):
@@ -71,13 +70,11 @@ async def start_udp_server():
                     logger.warning("Failed to parse syslog from %s", src_ip)
                     return
 
-                # Resolve device_id via in-memory cache (async)
+                # Resolve device_id via cache
                 device_id = await get_device_id(src_ip)
                 if not device_id:
                     logger.warning("No device_id found for IP %s", src_ip)
                     return
-
-                logger.debug("Resolved %s -> %s", src_ip, device_id)
 
                 profiles = get_profiles_for_device(device_id)
                 if not profiles:
@@ -91,11 +88,12 @@ async def start_udp_server():
                     prof_id = prof["id"]
                     prof_type = prof["type"]
 
-                    # parse fields
+                    # parse profile criteria
                     prios = json.loads(prof["priorities"]) if prof.get("priorities") else None
                     facs = json.loads(prof["facilities"]) if prof.get("facilities") else None
                     kws = json.loads(prof["keywords"]) if prof.get("keywords") else []
 
+                    # keyword match (highest priority)
                     matched_kw = None
                     kw_score = 0.0
                     if kws:
@@ -104,16 +102,25 @@ async def start_udp_server():
                         except Exception:
                             logger.exception("Keyword matching error for profile %s", prof_id)
 
+                    # priority match (OR logic)
                     p_match = (not prios) or parsed["priority_code"] in prios
+
+                    # facility match (OR logic)
                     f_match = (not facs) or parsed["facility_code"] in facs
-                    accept = bool(matched_kw or (p_match and f_match))
+
+                    # NEW ACCEPTANCE RULE
+                    accept = False
+                    if matched_kw:
+                        accept = True
+                    elif p_match or f_match:
+                        accept = True
 
                     if not accept:
                         logger.debug("Profile %s did not accept message", prof_id)
                         continue
 
+                    # INTERNAL → store incident
                     if prof_type == "internal":
-                        # store incident
                         try:
                             with get_db_connection() as cnx:
                                 cursor = cnx.cursor()
@@ -138,17 +145,20 @@ async def start_udp_server():
                                 logger.info("Stored incident %s for profile %s device %s", iid, prof_id, device_id)
                         except Exception:
                             logger.exception("DB insert error for profile %s", prof_id)
+
                     else:
-                        # external: forward
+                        # EXTERNAL → forward ALWAYS (unchanged)
                         integrations = get_integrations_for_profile(prof_id)
                         if not integrations:
                             logger.info("External profile %s has no integrations", prof_id)
+
                         for integ in integrations:
                             try:
                                 forward_to_integration(integ, parsed)
                                 did_forward = True
                             except Exception:
-                                logger.exception("Forwarding failed for profile %s integration %s", prof_id, integ.get("id"))
+                                logger.exception("Forwarding failed for profile %s integration %s",
+                                                 prof_id, integ.get("id"))
 
                 if not did_store:
                     logger.debug("No internal incidents stored for device %s", device_id)

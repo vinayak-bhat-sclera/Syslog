@@ -130,4 +130,67 @@ def get_devices_by_profile(
         "count": len(devices),
         "device_ids": devices,
     }
+    # ───────────────────────────────────────────────────────────────
+    # NEW: Get device_ids with profile_type mapping
+    # ───────────────────────────────────────────────────────────────
+@router.get(
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_device_idtypes",
+    status_code=status.HTTP_200_OK,
+)
+def get_device_ids_with_profile_types(
+    username: str = Path(...),
+    vdmsid: str = Path(...),
+    docker_name: str = Path(...),
+    page: Any = Query(1, description="Page number (int or str)"),
+    limit: Any = Query(100, description="Limit (int or str)"),
+):
+    """
+    Returns device_ids along with corresponding profile_type.
+    Example:
+        [
+            {"device_id": "...", "profile_type": "internal"},
+            {"device_id": "...", "profile_type": "external"}
+        ]
+    """
 
+    # Convert pagination safely
+    try:
+        page = int(page)
+        limit = int(limit)
+    except:
+        raise HTTPException(status_code=422, detail="page and limit must be integers")
+
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=422, detail="page and limit must be >= 1")
+
+    offset = (page - 1) * limit
+
+    sql = """
+        SELECT DISTINCT 
+            pd.device_id,
+            p.type AS profile_type
+        FROM syslog_profile_devices pd
+        JOIN syslog_profiles p ON pd.profile_id = p.id
+        WHERE p.docker_name = %s
+        ORDER BY pd.device_id ASC
+        LIMIT %s OFFSET %s
+    """
+
+    try:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(dictionary=True)
+            cursor.execute(sql, (docker_name, limit, offset))
+            rows = cursor.fetchall() or []
+            cursor.close()
+
+    except Exception as e:
+        logger.exception("get_device_ids_with_profile_types failed: %s", e)
+        raise HTTPException(status_code=400, detail="DB error fetching device ID types")
+
+    return {
+        "total": len(rows),
+        "page": page,
+        "limit": limit,
+        "docker_name": docker_name,
+        "items": rows,
+    }

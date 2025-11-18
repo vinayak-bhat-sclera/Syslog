@@ -15,6 +15,11 @@ from app.services.device_cache import (
     clear_profile_devices,
     notify_profile_change,
 )
+from pydantic import BaseModel
+
+class ProfileDeleteRequest(BaseModel):
+    profile_ids: List[str]
+
 
 router = APIRouter()
 logger = logging.getLogger("app.routers.profiles")
@@ -239,27 +244,21 @@ async def update_profile(
 # ─────────────────────────────
 @router.post(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/delete",
-    status_code=status.HTTP_200_OK,
+    status_code=200,
 )
-async def delete_profiles(
+async def delete_multiple_profiles(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    body: Dict[str, List[str]] = Body(..., example={"ids": ["id1", "id2"]}),
+    body: ProfileDeleteRequest = Body(...),
 ):
     """
-    Delete one OR multiple profiles.
-    Body: { "ids": ["id1", "id2", ...] }
-    Ensures:
-        - docker_name must match
-        - integrations linked to the profile are deleted
-        - profile_devices are deleted
-        - profile is deleted
-        - cache refresh is triggered
+    Delete multiple profiles by IDs (POST request with body).
+    Also deletes devices + integrations tied to those profiles.
     """
-    ids = body.get("ids")
-    if not ids or not isinstance(ids, list):
-        raise HTTPException(status_code=422, detail="Body must contain 'ids' list")
+
+    if not body.profile_ids:
+        raise HTTPException(status_code=422, detail="profile_ids list cannot be empty")
 
     deleted = []
 
@@ -267,39 +266,53 @@ async def delete_profiles(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            for pid in ids:
-                # validate profile exists
-                cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (pid,))
-                row = cursor.fetchone()
-                if not row:
-                    continue  # silently skip invalid IDs
+            for pid in body.profile_ids:
 
-                # check docker_name matches EXACTLY
+                # Verify profile exists
+                cursor.execute(
+                    "SELECT docker_name FROM syslog_profiles WHERE id=%s",
+                    (pid,)
+                )
+                row = cursor.fetchone()
+
+                if not row:
+                    continue  # skip missing profiles
+
                 if row["docker_name"] != docker_name:
-                    continue  # skip IDs not belonging to this docker
+                    continue  # skip mismatched docker_name
+
+                # Delete profile devices
+                cursor.execute(
+                    "DELETE FROM syslog_profile_devices WHERE profile_id=%s",
+                    (pid,)
+                )
 
                 # Delete integrations
-                cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
+                cursor.execute(
+                    "DELETE FROM syslog_integration WHERE profile_id=%s",
+                    (pid,)
+                )
 
-                # Delete devices
-                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+                # Delete profile itself
+                cursor.execute(
+                    "DELETE FROM syslog_profiles WHERE id=%s",
+                    (pid,)
+                )
 
-                # Delete profile
-                cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
                 deleted.append(pid)
 
             cnx.commit()
             cursor.close()
 
-        # trigger cache updates for each profile
-        for pid in deleted:
-            asyncio.create_task(notify_profile_change(pid))
-
     except Exception as e:
-        logger.exception("delete_profiles failed")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.exception("Bulk delete profiles failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {"status": "deleted", "deleted_ids": deleted, "count": len(deleted)}
+    return {
+        "status": "success",
+        "deleted_ids": deleted,
+        "skipped_ids": list(set(body.profile_ids) - set(deleted)),
+    }
 
 # ─────────────────────────────
 # DELETE ALL PROFILES FOR A DOCKER
