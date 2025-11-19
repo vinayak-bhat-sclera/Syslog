@@ -286,14 +286,14 @@ def get_all_integrations(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    profile_name: Optional[str] = Query(None),
+    profile_name: Optional[str] = Query(None, description="Single or comma-separated values"),
     search: Optional[str] = Query(None),
-    page: Any = Query(1, description="Page number (int or string)"),
-    limit: Any = Query(50, description="Limit (int or string)"),
+    page: Any = Query(1),
+    limit: Any = Query(50),
 ):
-    """Return paginated integrations with safe int conversion for page/limit."""
+    """Get integrations with multi-select profile_name, search, and docker_name='all' support."""
 
-    # Convert page & limit to integers
+    # Convert to int
     try:
         page = int(page)
         limit = int(limit)
@@ -301,21 +301,39 @@ def get_all_integrations(
         raise HTTPException(status_code=422, detail="page and limit must be integers")
 
     if page < 1 or limit < 1:
-        raise HTTPException(status_code=422, detail="page and limit must be >= 1")
+        raise HTTPException(status_code=422, detail="page & limit must be >= 1")
 
-    params: List[Any] = [docker_name]
-    where_clauses: List[str] = ["i.docker_name = %s"]
+    where_clauses = []
+    params: List[Any] = []
 
+    # ----------------------------------
+    # 1️⃣ Docker Name Filter
+    # ----------------------------------
+    if docker_name.lower() != "all":
+        where_clauses.append("i.docker_name = %s")
+        params.append(docker_name)
+
+    # ----------------------------------
+    # 2️⃣ Profile Name Multi-Select Filter
+    # ----------------------------------
     if profile_name:
-        where_clauses.append("LOWER(p.name) LIKE %s")
-        params.append(f"%{profile_name.lower()}%")
+        names = [x.strip().lower() for x in profile_name.split(",") if x.strip()]
 
+        profile_filters = " OR ".join(["LOWER(p.name) LIKE %s" for _ in names])
+        where_clauses.append(f"({profile_filters})")
+
+        params.extend([f"%{n}%" for n in names])
+
+    # ----------------------------------
+    # 3️⃣ Search Filter
+    # ----------------------------------
     if search:
         where_clauses.append("LOWER(i.destination_name) LIKE %s")
         params.append(f"%{search.lower()}%")
 
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
     offset = (page - 1) * limit
-    where = "WHERE " + " AND ".join(where_clauses)
 
     sql = f"""
         SELECT 
@@ -329,8 +347,9 @@ def get_all_integrations(
             i.auth_token,
             i.docker_name
         FROM syslog_integration i
-        JOIN syslog_profiles p ON i.profile_id = p.id
-        {where}
+        JOIN syslog_profiles p 
+            ON i.profile_id = p.id
+        {where_sql}
         ORDER BY i.destination_name ASC
         LIMIT %s OFFSET %s
     """
@@ -341,8 +360,12 @@ def get_all_integrations(
         rows = cursor.fetchall() or []
         cursor.close()
 
-    return {"total": len(rows), "page": page, "limit": limit, "items": rows}
-
+    return {
+        "total": len(rows),
+        "page": page,
+        "limit": limit,
+        "items": rows,
+    }
 
 # ─────────────────────────────
 # Get Single Integration

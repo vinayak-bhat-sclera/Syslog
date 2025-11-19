@@ -30,7 +30,7 @@ def list_incidents(
     limit: Any = Query(10, description="Limit per page"),
 ) -> Dict[str, Any]:
 
-    # Validate device_id belongs to this docker_name  ❗ NEW
+    # Validate device_id belongs to this docker_name   NEW
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)

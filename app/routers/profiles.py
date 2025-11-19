@@ -379,16 +379,23 @@ def get_all_profiles(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    profile_type: Optional[str] = Query(None),
+    profile_type: Optional[str] = Query(None, description="Single or comma-separated values"),
     search: Optional[str] = Query(None),
     page: Any = Query(1),
     limit: Any = Query(50),
 ):
     """
-    List profiles for EXACT docker_name.
+    List profiles.
+    - docker_name = specific name → filter normally
+    - docker_name = 'all' → return all profiles (ignore docker filter)
+    - profile_type supports multi-select: internal,external
     """
-    _validate_docker_name(docker_name)
 
+    # Validate docker only if not 'all'
+    if docker_name.lower() != "all":
+        _validate_docker_name(docker_name)
+
+    # Ensure int pagination
     try:
         page = int(page)
         limit = int(limit)
@@ -398,26 +405,54 @@ def get_all_profiles(
     if page < 1 or limit < 1:
         raise HTTPException(status_code=422, detail="page and limit must be >= 1")
 
-    params: List[Any] = [docker_name]
-    where_clauses = ["docker_name = %s"]
+    where_clauses = []
+    params: List[Any] = []
 
+    # ------------------------------------------
+    # 1️ Docker Filter (SKIPPED when 'all')
+    # ------------------------------------------
+    if docker_name.lower() != "all":
+        where_clauses.append("docker_name = %s")
+        params.append(docker_name)
+
+    # ------------------------------------------
+    # 2️ Multi-select Profile Type Filter
+    #    Example: profile_type=internal,external
+    # ------------------------------------------
     if profile_type:
-        where_clauses.append("`type` = %s")
-        params.append(profile_type)
+        type_list = [
+            t.strip().lower()
+            for t in profile_type.split(",")
+            if t.strip()
+        ]
 
+        type_filters = " OR ".join(["LOWER(`type`) = %s" for _ in type_list])
+        where_clauses.append(f"({type_filters})")
+        params.extend(type_list)
+
+    # ------------------------------------------
+    # 3️ Search Filter (partial match)
+    # ------------------------------------------
     if search:
         where_clauses.append("LOWER(name) LIKE %s")
-        params.append(f"%{search.lower()}%")
+        params.append(f"%{search.lower().strip()}%")
 
-    where = " WHERE " + " AND ".join(where_clauses)
+    # Build final WHERE
+    where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
     offset = (page - 1) * limit
 
     sql = f"""
         SELECT 
-            id, name, `type` AS profile_type, docker_name,
-            priorities, facilities, keywords
+            id,
+            name,
+            `type` AS profile_type,
+            docker_name,
+            priorities,
+            facilities,
+            keywords
         FROM syslog_profiles
-        {where}
+        {where_sql}
         ORDER BY name ASC
         LIMIT %s OFFSET %s
     """
@@ -428,7 +463,12 @@ def get_all_profiles(
         rows = cursor.fetchall() or []
         cursor.close()
 
-    return {"total": len(rows), "page": page, "limit": limit, "items": rows}
+    return {
+        "total": len(rows),
+        "page": page,
+        "limit": limit,
+        "items": rows,
+    }
 
 
 # ─────────────────────────────
