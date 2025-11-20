@@ -1,12 +1,20 @@
 # app/routers/profiles.py
-
 import json
 import uuid
 import logging
 import asyncio
 from typing import Dict, Optional, Any, List
+import httpx
+from app.config import settings
 
-from fastapi import APIRouter, HTTPException, Path, Query, status, Body
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Path,
+    Query,
+    status,
+    Body,
+)
 
 from app.db import get_db_connection
 from app.models import profiles as profile_models
@@ -15,7 +23,9 @@ from app.services.device_cache import (
     clear_profile_devices,
     notify_profile_change,
 )
+
 from pydantic import BaseModel
+
 
 class ProfileDeleteRequest(BaseModel):
     profile_ids: List[str]
@@ -86,8 +96,7 @@ async def create_profile(
                         """,
                         (rid, pid, device_id.strip()),
                     )
-                cnx.commit()
-
+            cnx.commit()
             cursor.close()
 
         # Clear all cache (async)
@@ -127,10 +136,9 @@ async def update_profile(
     Update profile.
 
     Behavior:
-    - docker_name == "all"  → update regardless of stored docker_name
-    - otherwise            → enforce exact docker match
+    - docker_name == "all" → update regardless of stored docker_name
+    - otherwise → enforce exact docker match
     """
-
     _validate_docker_name(docker_name)
     update_all = (docker_name.lower().strip() == "all")
 
@@ -145,14 +153,14 @@ async def update_profile(
             if not existing:
                 raise HTTPException(status_code=404, detail="Profile not found")
 
-            # Enforce docker matching only if NOT using "all"
+            # Enforce docker matching
             if not update_all and existing["docker_name"] != docker_name:
                 raise HTTPException(status_code=403, detail="docker_name mismatch")
 
             preserved_type = existing["type"]
             new_name = p.name if p and p.name is not None else existing["name"]
 
-            # Internal/external logic
+            # internal/external logic
             if preserved_type == "external":
                 prio_json = fac_json = kws_json = None
             else:
@@ -185,7 +193,10 @@ async def update_profile(
 
             # Device list update
             if p and p.device_ids is not None:
-                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
+                cursor.execute(
+                    "DELETE FROM syslog_profile_devices WHERE profile_id=%s",
+                    (profile_id,),
+                )
                 for device_id in p.device_ids:
                     rid = str(uuid.uuid4())
                     cursor.execute(
@@ -195,8 +206,7 @@ async def update_profile(
                         """,
                         (rid, profile_id, device_id.strip()),
                     )
-                cnx.commit()
-
+            cnx.commit()
             cursor.close()
 
         # Cache refresh
@@ -211,57 +221,8 @@ async def update_profile(
     return {
         "status": "updated",
         "id": profile_id,
-        "mode": "all-dockers" if update_all else "single-docker"
+        "mode": "all-dockers" if update_all else "single-docker",
     }
-
-
-# # ─────────────────────────────
-# # DELETE PROFILE
-# # ─────────────────────────────
-# @router.delete(
-#     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/delete",
-#     status_code=status.HTTP_200_OK,
-# )
-# async def delete_profile(
-#     username: str = Path(...),
-#     vdmsid: str = Path(...),
-#     docker_name: str = Path(...),
-#     profile_id: str = Path(...),
-# ):
-#     """
-#     Delete profile. docker_name compared EXACTLY.
-#     """
-#     _validate_docker_name(docker_name)
-
-#     try:
-#         with get_db_connection() as cnx:
-#             cursor = cnx.cursor(dictionary=True)
-
-#             cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
-#             row = cursor.fetchone()
-
-#             if not row:
-#                 raise HTTPException(status_code=404, detail="Profile not found")
-
-#             # Exact match only
-#             if row["docker_name"] != docker_name:
-#                 raise HTTPException(status_code=403, detail="docker_name mismatch")
-
-#             cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
-#             cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (profile_id,))
-#             cnx.commit()
-
-#             cursor.close()
-
-#         asyncio.create_task(notify_profile_change(profile_id))
-
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.exception("delete_profile failed")
-#         raise HTTPException(status_code=400, detail=str(e))
-
-#     return {"status": "deleted", "id": profile_id}
 
 
 # ─────────────────────────────
@@ -283,7 +244,6 @@ async def delete_multiple_profiles(
     docker_name = "all" → delete ALL provided profile_ids (no docker filter)
     otherwise → delete only profiles from that docker_name
     """
-
     if not body.profile_ids:
         raise HTTPException(status_code=422, detail="profile_ids list cannot be empty")
 
@@ -293,11 +253,9 @@ async def delete_multiple_profiles(
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
-
             delete_all = (docker_name.lower().strip() == "all")
 
             for pid in body.profile_ids:
-
                 cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (pid,))
                 row = cursor.fetchone()
 
@@ -312,7 +270,6 @@ async def delete_multiple_profiles(
                 cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
                 cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
                 cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
-
                 deleted.append(pid)
 
             cnx.commit()
@@ -358,27 +315,20 @@ async def delete_all_profiles(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            # ─────────────────────────────────────────
             # MODE 1: delete EVERYTHING
-            # ─────────────────────────────────────────
             if docker_name.lower().strip() == "all":
-                # Get all profile_ids
                 cursor.execute("SELECT id FROM syslog_profiles")
                 rows = cursor.fetchall() or []
                 profile_ids = [r["id"] for r in rows]
 
                 if profile_ids:
-                    # Delete integrations
                     cursor.execute("DELETE FROM syslog_integration")
-                    # Delete devices
                     cursor.execute("DELETE FROM syslog_profile_devices")
-                    # Delete profiles
                     cursor.execute("DELETE FROM syslog_profiles")
 
                 cnx.commit()
                 cursor.close()
 
-                # send notifications
                 for pid in profile_ids:
                     asyncio.create_task(notify_profile_change(pid))
 
@@ -386,15 +336,13 @@ async def delete_all_profiles(
                     "status": "deleted_all",
                     "count": len(profile_ids),
                     "deleted_ids": profile_ids,
-                    "docker_name": "all"
+                    "docker_name": "all",
                 }
 
-            # ─────────────────────────────────────────
-            # MODE 2: delete ONLY specific docker
-            # ─────────────────────────────────────────
+            # MODE 2: delete only specific docker
             cursor.execute(
                 "SELECT id FROM syslog_profiles WHERE docker_name=%s",
-                (docker_name,)
+                (docker_name,),
             )
             rows = cursor.fetchall() or []
             profile_ids = [r["id"] for r in rows]
@@ -419,7 +367,7 @@ async def delete_all_profiles(
         "status": "deleted_all",
         "count": len(deleted_ids),
         "deleted_ids": deleted_ids,
-        "docker_name": docker_name
+        "docker_name": docker_name,
     }
 
 
@@ -446,7 +394,6 @@ def get_all_profiles(
     - profile_type supports multi-select: internal,external
     """
 
-    # Validate docker only if not 'all'
     if docker_name.lower() != "all":
         _validate_docker_name(docker_name)
 
@@ -463,42 +410,32 @@ def get_all_profiles(
     where_clauses = []
     params: List[Any] = []
 
-    # ------------------------------------------
-    # 1️ Docker Filter (SKIPPED when 'all')
-    # ------------------------------------------
+    # 1. Docker Filter
     if docker_name.lower() != "all":
         where_clauses.append("docker_name = %s")
         params.append(docker_name)
 
-    # ------------------------------------------
-    # 2️ Multi-select Profile Type Filter
-    #    Example: profile_type=internal,external
-    # ------------------------------------------
+    # 2. Multi-select Type Filter
     if profile_type:
         type_list = [
             t.strip().lower()
             for t in profile_type.split(",")
             if t.strip()
         ]
-
         type_filters = " OR ".join(["LOWER(`type`) = %s" for _ in type_list])
         where_clauses.append(f"({type_filters})")
         params.extend(type_list)
 
-    # ------------------------------------------
-    # 3️ Search Filter (partial match)
-    # ------------------------------------------
+    # 3. Search Filter
     if search:
         where_clauses.append("LOWER(name) LIKE %s")
         params.append(f"%{search.lower().strip()}%")
 
-    # Build final WHERE
     where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
-
     offset = (page - 1) * limit
 
     sql = f"""
-        SELECT 
+        SELECT
             id,
             name,
             `type` AS profile_type,
@@ -533,24 +470,25 @@ def get_all_profiles(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}",
     status_code=status.HTTP_200_OK,
 )
-def get_profile(
+async def get_profile(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
     profile_id: str = Path(...),
 ):
     """
-    Fetch one profile.
-    If docker_name == 'all' → ignore docker validation.
-    Else enforce exact match.
+    Fetch single profile.
+    If docker_name == "all" → ignore docker validation.
+    Also return device_details fetched from Spring Boot using device_ids.
     """
     _validate_docker_name(docker_name)
 
+    # 1. Fetch PROFILE
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT id, name, `type` AS profile_type, docker_name,
+            SELECT id, name, type AS profile_type, docker_name,
                    priorities, facilities, keywords
             FROM syslog_profiles
             WHERE id=%s
@@ -558,16 +496,67 @@ def get_profile(
             (profile_id,),
         )
         row = cursor.fetchone()
+
+        if not row:
+            cursor.close()
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        # 2. Fetch DEVICE IDs
+        cursor.execute(
+            """
+            SELECT device_id 
+            FROM syslog_profile_devices 
+            WHERE profile_id = %s
+            """,
+            (profile_id,),
+        )
+        device_rows = cursor.fetchall()
         cursor.close()
 
-    if not row:
-        raise HTTPException(status_code=404, detail="Profile not found")
+    device_ids = [d["device_id"] for d in device_rows]
 
-    # ─────────────────────────────────────────────
-    # NEW: allow docker_name = "all"
-    # ─────────────────────────────────────────────
+    # 3. Docker validation (skip if docker_name == 'all')
     if docker_name.lower().strip() != "all":
         if row["docker_name"] != docker_name:
             raise HTTPException(status_code=403, detail="docker_name mismatch")
+
+    # 4. Call Spring Boot for device details
+    device_details = []
+    if device_ids:
+        try:
+            # Correct SpringBoot URL
+            spring_url = (
+                f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}"
+                f"/docker/{docker_name}/getdevicedetailsbyids"
+            )
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                spring_resp = await client.post(
+                    spring_url,
+                    json=device_ids,
+                    params={"pageno": 1, "pagesize": 100},
+                )
+
+            # Correct JSON parsing for BOTH mock and real server
+            try:
+                data = spring_resp.json()
+
+                if isinstance(data, list):
+                    device_details = data
+                elif isinstance(data, dict) and "data" in data:
+                    device_details = data["data"]
+                else:
+                    device_details = []
+
+            except Exception:
+                device_details = []
+
+        except Exception as e:
+            logger.error("SpringBoot call failed: %s", e)
+            device_details = []
+
+    # 5. Final response
+    row["device_ids"] = device_ids
+    row["device_details"] = device_details
 
     return row

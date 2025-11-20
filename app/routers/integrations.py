@@ -42,7 +42,33 @@ def create_integration(
     i: integ_models.IntegrationIn = Body(...),
 ) -> Dict[str, str]:
 
+    # Validate the profile belongs to this docker_name
     _validate_docker_name_for_profile(i.profile_id, docker_name)
+
+    # STRICT ENFORCEMENT: ensure profile_id is not used under another docker
+    with get_db_connection() as cnx:
+        cursor = cnx.cursor()
+        cursor.execute(
+            """
+            SELECT docker_name 
+            FROM syslog_integration 
+            WHERE profile_id = %s
+            """,
+            (i.profile_id,)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+
+    for (existing_docker,) in rows:
+        if existing_docker != docker_name:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Profile ID '{i.profile_id}' is already used under docker '{existing_docker}'. "
+                    f"Cannot reuse it under '{docker_name}'."
+                )
+            )
+
     iid = str(uuid.uuid4())
 
     try:
@@ -73,7 +99,6 @@ def create_integration(
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"status": "created", "id": iid}
-
 
 # ─────────────────────────────
 # Update Integration

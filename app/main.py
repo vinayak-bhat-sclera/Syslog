@@ -8,6 +8,7 @@ from app.db import init_db
 from app.utils.logging import configure_logging
 from app.routers import profiles, integrations, profile_devices, incidents, health, cache_monitor
 from app.services.udp_server import start_udp_server
+from app.db import start_incident_cleanup_scheduler
 
 # NEW: import cache background task manager
 from app.services.device_cache import start_background_tasks, stop_background_tasks
@@ -40,6 +41,10 @@ async def on_startup():
     # Start background device-cache refresh + snapshot task
     global device_cache_task
     device_cache_task = start_background_tasks()
+
+    # ✅ Start daily cleanup scheduler (delete syslog_incidents older than 30 days)
+    start_incident_cleanup_scheduler()
+    
 
 
 @app.on_event("shutdown")

@@ -168,3 +168,45 @@ def init_db():
             logger.info("DB tables initialized successfully.")
         finally:
             cursor.close()
+
+# -------------------------------------------------------------
+# NEW — CLEANUP FUNCTION
+# -------------------------------------------------------------
+def cleanup_old_incidents():
+    """
+    Delete syslog incidents older than 30 days.
+    Runs once a day from background scheduler.
+    """
+    try:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor()
+
+            cursor.execute(
+                """
+                DELETE FROM syslog_incidents
+                WHERE timestamp < NOW() - INTERVAL 30 DAY
+                """
+            )
+            deleted = cursor.rowcount
+            cnx.commit()
+            cursor.close()
+
+        logger.info(f"[CLEANUP] Deleted {deleted} old syslog_incidents rows")
+
+    except Exception as e:
+        logger.error(f"[CLEANUP] Error cleaning old incidents: {e}")
+
+
+# -------------------------------------------------------------
+# NEW — BACKGROUND SCHEDULER LOOP
+# -------------------------------------------------------------
+async def start_incident_cleanup_scheduler():
+    """
+    Runs cleanup once every 24 hours 
+    """
+    await asyncio.sleep(5)  # Small delay to let app boot fully
+    logger.info("Starting daily syslog_incidents cleanup scheduler...")
+
+    while True:
+        cleanup_old_incidents()
+        await asyncio.sleep(24 * 60 * 60)  # wait 24h
