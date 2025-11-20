@@ -89,7 +89,15 @@ def update_integration(
     integration_id: str = Path(...),
     i: integ_models.IntegrationIn = Body(...),
 ):
-    """Update existing integration; ensure docker_name matches linked profile."""
+    """
+    Update integration.
+
+    Behavior:
+    - docker_name == "all" → update regardless of profile/docker matching
+    - otherwise            → validate old + new profile_id belong to this docker_name
+    """
+
+    update_all = (docker_name.lower().strip() == "all")
 
     # Fetch existing integration → get old profile_id
     with get_db_connection() as cnx:
@@ -101,11 +109,12 @@ def update_integration(
     if not existing:
         raise HTTPException(status_code=404, detail="Integration not found")
 
-    # Validate OLD profile_id matches docker_name
-    _validate_docker_name_for_profile(existing["profile_id"], docker_name)
+    old_profile_id = existing["profile_id"]
 
-    # Validate NEW profile_id also matches docker_name  ❗ FIX ADDED
-    _validate_docker_name_for_profile(i.profile_id, docker_name)
+    # Validate ONLY if docker_name != "all"
+    if not update_all:
+        _validate_docker_name_for_profile(old_profile_id, docker_name)
+        _validate_docker_name_for_profile(i.profile_id, docker_name)
 
     # Perform update
     try:
@@ -115,7 +124,11 @@ def update_integration(
             cursor.execute(
                 """
                 UPDATE syslog_integration
-                SET destination_name=%s, ip_address=%s, port=%s, auth_token=%s, profile_id=%s
+                SET destination_name=%s,
+                    ip_address=%s,
+                    port=%s,
+                    auth_token=%s,
+                    profile_id=%s
                 WHERE id=%s
                 """,
                 (
@@ -135,7 +148,11 @@ def update_integration(
         logger.exception("update_integration failed")
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {"status": "updated", "id": integration_id}
+    return {
+        "status": "updated",
+        "id": integration_id,
+        "mode": "all-dockers" if update_all else "single-docker",
+    }
 
 
 # # ─────────────────────────────
@@ -199,10 +216,14 @@ def delete_multiple_integrations(
     not_found = []
     mismatched = []
 
+    delete_all = (docker_name.lower().strip() == "all")
+
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
 
         for iid in integration_ids:
+
+            # Check if integration exists
             cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (iid,))
             row = cursor.fetchone()
 
@@ -210,12 +231,15 @@ def delete_multiple_integrations(
                 not_found.append(iid)
                 continue
 
-            try:
-                _validate_docker_name_for_profile(row["profile_id"], docker_name)
-            except HTTPException:
-                mismatched.append(iid)
-                continue
+            # If NOT "all", validate docker_name matches
+            if not delete_all:
+                try:
+                    _validate_docker_name_for_profile(row["profile_id"], docker_name)
+                except HTTPException:
+                    mismatched.append(iid)
+                    continue
 
+            # Delete the integration
             cursor.execute("DELETE FROM syslog_integration WHERE id=%s", (iid,))
             deleted.append(iid)
 
@@ -224,6 +248,7 @@ def delete_multiple_integrations(
 
     return {
         "status": "completed",
+        "mode": "all-dockers" if delete_all else "single-docker",
         "deleted": deleted,
         "not_found": not_found,
         "docker_mismatch": mismatched,
@@ -416,7 +441,7 @@ def get_integration(
         cursor = cnx.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT i.*, p.name AS profile_name, p.type AS profile_type
+            SELECT i.*, p.name AS profile_name, p.type AS profile_type, p.docker_name AS profile_docker
             FROM syslog_integration i
             JOIN syslog_profiles p ON i.profile_id = p.id
             WHERE i.id=%s
@@ -429,6 +454,12 @@ def get_integration(
     if not row:
         raise HTTPException(status_code=404, detail="Integration not found")
 
-    _validate_docker_name_for_profile(row["profile_id"], docker_name)
+    # ─────────────────────────────────────────────
+    # NEW: allow docker_name = "all"
+    # ─────────────────────────────────────────────
+    if docker_name.lower().strip() != "all":
+        # enforce strict match
+        if row["profile_docker"] != docker_name:
+            raise HTTPException(status_code=403, detail="docker_name mismatch")
 
     return row

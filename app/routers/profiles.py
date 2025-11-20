@@ -119,39 +119,60 @@ async def create_profile(
 async def update_profile(
     username: str = Path(...),
     vdmsid: str = Path(...),
-    docker_name: str = Path(..., description="Docker name (MUST match DB EXACTLY)"),
+    docker_name: str = Path(..., description="Docker name"),
     profile_id: str = Path(...),
     p: profile_models.ProfileUpdate = Body(None),
 ):
     """
     Update profile.
-    docker_name is compared EXACTLY (case-sensitive).
+
+    Behavior:
+    - docker_name == "all"  → update regardless of stored docker_name
+    - otherwise            → enforce exact docker match
     """
+
     _validate_docker_name(docker_name)
+    update_all = (docker_name.lower().strip() == "all")
 
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
+            # Fetch existing profile
             cursor.execute("SELECT * FROM syslog_profiles WHERE id=%s", (profile_id,))
             existing = cursor.fetchone()
+
             if not existing:
                 raise HTTPException(status_code=404, detail="Profile not found")
 
-            # IMPORTANT → must match exactly, no lower(), upper(), strip()
-            if existing["docker_name"] != docker_name:
+            # Enforce docker matching only if NOT using "all"
+            if not update_all and existing["docker_name"] != docker_name:
                 raise HTTPException(status_code=403, detail="docker_name mismatch")
 
             preserved_type = existing["type"]
             new_name = p.name if p and p.name is not None else existing["name"]
 
+            # Internal/external logic
             if preserved_type == "external":
                 prio_json = fac_json = kws_json = None
             else:
-                prio_json = json.dumps(p.priorities) if p and p.priorities is not None else existing.get("priorities")
-                fac_json = json.dumps(p.facilities) if p and p.facilities is not None else existing.get("facilities")
-                kws_json = json.dumps(p.keywords) if p and p.keywords is not None else existing.get("keywords")
+                prio_json = (
+                    json.dumps(p.priorities)
+                    if p and p.priorities is not None
+                    else existing.get("priorities")
+                )
+                fac_json = (
+                    json.dumps(p.facilities)
+                    if p and p.facilities is not None
+                    else existing.get("facilities")
+                )
+                kws_json = (
+                    json.dumps(p.keywords)
+                    if p and p.keywords is not None
+                    else existing.get("keywords")
+                )
 
+            # Update profile
             cursor.execute(
                 """
                 UPDATE syslog_profiles
@@ -162,7 +183,7 @@ async def update_profile(
             )
             cnx.commit()
 
-            # Update device list if provided
+            # Device list update
             if p and p.device_ids is not None:
                 cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
                 for device_id in p.device_ids:
@@ -178,7 +199,7 @@ async def update_profile(
 
             cursor.close()
 
-        # Refresh profile cache
+        # Cache refresh
         asyncio.create_task(notify_profile_change(profile_id))
 
     except HTTPException:
@@ -187,7 +208,11 @@ async def update_profile(
         logger.exception("update_profile failed")
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {"status": "updated", "id": profile_id}
+    return {
+        "status": "updated",
+        "id": profile_id,
+        "mode": "all-dockers" if update_all else "single-docker"
+    }
 
 
 # # ─────────────────────────────
@@ -253,56 +278,48 @@ async def delete_multiple_profiles(
     body: ProfileDeleteRequest = Body(...),
 ):
     """
-    Delete multiple profiles by IDs (POST request with body).
-    Also deletes devices + integrations tied to those profiles.
+    Delete multiple profiles by IDs.
+
+    docker_name = "all" → delete ALL provided profile_ids (no docker filter)
+    otherwise → delete only profiles from that docker_name
     """
 
     if not body.profile_ids:
         raise HTTPException(status_code=422, detail="profile_ids list cannot be empty")
 
     deleted = []
+    skipped = []
 
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
+            delete_all = (docker_name.lower().strip() == "all")
+
             for pid in body.profile_ids:
 
-                # Verify profile exists
-                cursor.execute(
-                    "SELECT docker_name FROM syslog_profiles WHERE id=%s",
-                    (pid,)
-                )
+                cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (pid,))
                 row = cursor.fetchone()
 
                 if not row:
-                    continue  # skip missing profiles
+                    skipped.append(pid)
+                    continue
 
-                if row["docker_name"] != docker_name:
-                    continue  # skip mismatched docker_name
+                if not delete_all and row["docker_name"] != docker_name:
+                    skipped.append(pid)
+                    continue
 
-                # Delete profile devices
-                cursor.execute(
-                    "DELETE FROM syslog_profile_devices WHERE profile_id=%s",
-                    (pid,)
-                )
-
-                # Delete integrations
-                cursor.execute(
-                    "DELETE FROM syslog_integration WHERE profile_id=%s",
-                    (pid,)
-                )
-
-                # Delete profile itself
-                cursor.execute(
-                    "DELETE FROM syslog_profiles WHERE id=%s",
-                    (pid,)
-                )
+                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+                cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
+                cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
 
                 deleted.append(pid)
 
             cnx.commit()
             cursor.close()
+
+        for pid in deleted:
+            asyncio.create_task(notify_profile_change(pid))
 
     except Exception as e:
         logger.exception("Bulk delete profiles failed")
@@ -311,8 +328,10 @@ async def delete_multiple_profiles(
     return {
         "status": "success",
         "deleted_ids": deleted,
-        "skipped_ids": list(set(body.profile_ids) - set(deleted)),
+        "skipped_ids": skipped,
+        "mode": "all-dockers" if delete_all else "single-docker",
     }
+
 
 # ─────────────────────────────
 # DELETE ALL PROFILES FOR A DOCKER
@@ -330,8 +349,8 @@ async def delete_all_profiles(
     Deletes ALL profiles (and their devices + integrations).
 
     Modes:
-    1️⃣ docker_name == "all" → delete EVERYTHING across all dockers.
-    2️⃣ specific docker_name → delete only profiles belonging to that docker.
+    docker_name == "all" → delete EVERYTHING across all dockers.
+    specific docker_name → delete only profiles belonging to that docker.
     """
     deleted_ids = []
 
@@ -521,7 +540,9 @@ def get_profile(
     profile_id: str = Path(...),
 ):
     """
-    Fetch one profile. docker_name compared EXACTLY.
+    Fetch one profile.
+    If docker_name == 'all' → ignore docker validation.
+    Else enforce exact match.
     """
     _validate_docker_name(docker_name)
 
@@ -542,8 +563,11 @@ def get_profile(
     if not row:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    # Must match exactly — no normalization
-    if row["docker_name"] != docker_name:
-        raise HTTPException(status_code=403, detail="docker_name mismatch")
+    # ─────────────────────────────────────────────
+    # NEW: allow docker_name = "all"
+    # ─────────────────────────────────────────────
+    if docker_name.lower().strip() != "all":
+        if row["docker_name"] != docker_name:
+            raise HTTPException(status_code=403, detail="docker_name mismatch")
 
     return row

@@ -30,32 +30,39 @@ def list_incidents(
     limit: Any = Query(10, description="Limit per page"),
 ) -> Dict[str, Any]:
 
-    # Validate device_id belongs to this docker_name   NEW
-    try:
-        with get_db_connection() as cnx:
-            cursor = cnx.cursor(dictionary=True)
-            cursor.execute(
-                """
-                SELECT p.docker_name
-                FROM syslog_profile_devices pd
-                JOIN syslog_profiles p ON p.id = pd.profile_id
-                WHERE pd.device_id = %s
-                """,
-                (device_id,),
-            )
-            row = cursor.fetchone()
-            cursor.close()
+    delete_all = (docker_name.lower().strip() == "all")
 
-        if not row:
-            raise HTTPException(status_code=404, detail="Device not found in any profile")
+    # ========================================================
+    # Validate device_id belongs to this docker_name  
+    # Skip validation if docker_name == "all"
+    # ========================================================
+    if not delete_all:
+        try:
+            with get_db_connection() as cnx:
+                cursor = cnx.cursor(dictionary=True)
+                cursor.execute(
+                    """
+                    SELECT p.docker_name
+                    FROM syslog_profile_devices pd
+                    JOIN syslog_profiles p ON p.id = pd.profile_id
+                    WHERE pd.device_id = %s
+                    """,
+                    (device_id,),
+                )
+                row = cursor.fetchone()
+                cursor.close()
 
-        if row["docker_name"] != docker_name:
-            raise HTTPException(status_code=403, detail="docker_name mismatch for device_id")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("docker_name validation failed: %s", e)
-        raise HTTPException(status_code=500, detail="Error validating docker_name")
+            if not row:
+                raise HTTPException(status_code=404, detail="Device not found in any profile")
+
+            if row["docker_name"] != docker_name:
+                raise HTTPException(status_code=403, detail="docker_name mismatch for device_id")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("docker_name validation failed: %s", e)
+            raise HTTPException(status_code=500, detail="Error validating docker_name")
 
     # Convert page, limit to int
     try:
@@ -84,6 +91,7 @@ def list_incidents(
     priority_code = convert_optional_int(priority_code)
     facility_code = convert_optional_int(facility_code)
 
+    # Query incidents
     try:
         params = [device_id]
         where = " WHERE inc.device_id = %s "
@@ -148,6 +156,7 @@ def list_incidents(
                 "until_ts": None,
             },
             "items": rows,
+            "mode": "all-dockers" if delete_all else "single-docker",
         }
 
     except HTTPException:
