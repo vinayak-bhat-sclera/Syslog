@@ -327,7 +327,11 @@ async def delete_all_profiles(
     docker_name: str = Path(...),
 ):
     """
-    Deletes ALL profiles (and their devices + integrations) belonging to the given docker_name.
+    Deletes ALL profiles (and their devices + integrations).
+
+    Modes:
+    1️⃣ docker_name == "all" → delete EVERYTHING across all dockers.
+    2️⃣ specific docker_name → delete only profiles belonging to that docker.
     """
     deleted_ids = []
 
@@ -335,28 +339,56 @@ async def delete_all_profiles(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(dictionary=True)
 
-            # Get all profiles under docker
-            cursor.execute("SELECT id FROM syslog_profiles WHERE docker_name=%s", (docker_name,))
-            rows = cursor.fetchall() or []
+            # ─────────────────────────────────────────
+            # MODE 1: delete EVERYTHING
+            # ─────────────────────────────────────────
+            if docker_name.lower().strip() == "all":
+                # Get all profile_ids
+                cursor.execute("SELECT id FROM syslog_profiles")
+                rows = cursor.fetchall() or []
+                profile_ids = [r["id"] for r in rows]
 
+                if profile_ids:
+                    # Delete integrations
+                    cursor.execute("DELETE FROM syslog_integration")
+                    # Delete devices
+                    cursor.execute("DELETE FROM syslog_profile_devices")
+                    # Delete profiles
+                    cursor.execute("DELETE FROM syslog_profiles")
+
+                cnx.commit()
+                cursor.close()
+
+                # send notifications
+                for pid in profile_ids:
+                    asyncio.create_task(notify_profile_change(pid))
+
+                return {
+                    "status": "deleted_all",
+                    "count": len(profile_ids),
+                    "deleted_ids": profile_ids,
+                    "docker_name": "all"
+                }
+
+            # ─────────────────────────────────────────
+            # MODE 2: delete ONLY specific docker
+            # ─────────────────────────────────────────
+            cursor.execute(
+                "SELECT id FROM syslog_profiles WHERE docker_name=%s",
+                (docker_name,)
+            )
+            rows = cursor.fetchall() or []
             profile_ids = [r["id"] for r in rows]
 
             for pid in profile_ids:
-                # Delete integrations
                 cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
-
-                # Delete device links
                 cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
-
-                # Delete profile
                 cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
-
                 deleted_ids.append(pid)
 
             cnx.commit()
             cursor.close()
 
-        # notify cache for each deleted id
         for pid in deleted_ids:
             asyncio.create_task(notify_profile_change(pid))
 
@@ -364,8 +396,12 @@ async def delete_all_profiles(
         logger.exception("delete_all_profiles failed")
         raise HTTPException(status_code=400, detail=str(e))
 
-    return {"status": "deleted_all", "count": len(deleted_ids), "deleted_ids": deleted_ids}
-
+    return {
+        "status": "deleted_all",
+        "count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "docker_name": docker_name
+    }
 
 
 # ─────────────────────────────

@@ -242,38 +242,69 @@ def delete_all_integrations(
     vdmsid: str = Path(...),
     docker_name: str = Path(...)
 ):
-    """Delete ALL integrations under this docker_name."""
+    """
+    Delete ALL integrations.
+
+    Modes:
+    docker_name == "all"  → Delete ALL integrations globally
+    Specific docker_name   → Delete integrations only for profiles under that docker
+    """
 
     with get_db_connection() as cnx:
         cursor = cnx.cursor()
 
-        cursor.execute("SELECT id FROM syslog_profiles WHERE docker_name=%s", (docker_name,))
+        # ─────────────────────────────
+        # MODE 1: DELETE EVERYTHING
+        # ─────────────────────────────
+        if docker_name.lower().strip() == "all":
+            cursor.execute("DELETE FROM syslog_integration")
+            deleted_count = cursor.rowcount
+            cnx.commit()
+            cursor.close()
+
+            return {
+                "status": "completed",
+                "deleted": deleted_count,
+                "docker_name": "all"
+            }
+
+        # ─────────────────────────────
+        # MODE 2: DELETE for specific docker_name
+        # ─────────────────────────────
+        cursor.execute(
+            "SELECT id FROM syslog_profiles WHERE docker_name=%s",
+            (docker_name,)
+        )
         profiles = [r[0] for r in cursor.fetchall() or []]
 
         if not profiles:
+            cursor.close()
             return {
                 "status": "completed",
                 "deleted": 0,
-                "detail": "No integrations found for docker_name"
+                "detail": f"No integrations found for docker_name '{docker_name}'"
             }
 
+        placeholder = ",".join(["%s"] * len(profiles))
+
         cursor.execute(
-            """
+            f"""
             DELETE FROM syslog_integration 
-            WHERE profile_id IN (%s)
-            """ % (",".join(["%s"] * len(profiles))),
+            WHERE profile_id IN ({placeholder})
+            """,
             profiles
         )
-        count = cursor.rowcount
-        cnx.commit()
 
+        deleted_count = cursor.rowcount
+        cnx.commit()
         cursor.close()
 
     return {
         "status": "completed",
-        "deleted": count,
+        "deleted": deleted_count,
         "docker_name": docker_name
     }
+
 
 # ─────────────────────────────
 # Get All Integrations
