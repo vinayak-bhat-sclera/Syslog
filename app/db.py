@@ -3,6 +3,8 @@ import contextlib
 import time
 import logging
 from typing import Optional
+import asyncio
+
 
 import mysql.connector
 from mysql.connector import pooling
