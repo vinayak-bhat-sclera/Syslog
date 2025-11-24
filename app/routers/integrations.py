@@ -17,8 +17,11 @@ logger = logging.getLogger("app.routers.integrations")
 def _validate_docker_name_for_profile(profile_id: str, docker_name: str):
     """Ensure the given profile_id belongs to the specified docker_name."""
     with get_db_connection() as cnx:
-        cursor = cnx.cursor()
-        cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
+        cursor = cnx.cursor(buffered=True)  # ★ FIXED
+        cursor.execute(
+            "SELECT docker_name FROM syslog_profiles WHERE id=%s",
+            (profile_id,),
+        )
         row = cursor.fetchone()
         cursor.close()
 
@@ -26,7 +29,6 @@ def _validate_docker_name_for_profile(profile_id: str, docker_name: str):
         raise HTTPException(status_code=404, detail="Profile not found for provided profile_id")
     if row[0] != docker_name:
         raise HTTPException(status_code=403, detail="docker_name mismatch for provided profile_id")
-
 
 # ─────────────────────────────
 # Create Integration
@@ -126,8 +128,11 @@ def update_integration(
 
     # Fetch existing integration → get old profile_id
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
-        cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (integration_id,))
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
+        cursor.execute(
+            "SELECT profile_id FROM syslog_integration WHERE id=%s",
+            (integration_id,),
+        )
         existing = cursor.fetchone()
         cursor.close()
 
@@ -144,7 +149,7 @@ def update_integration(
     # Perform update
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor()
+            cursor = cnx.cursor(buffered=True)  # ★ FIXED
 
             cursor.execute(
                 """
@@ -244,7 +249,7 @@ def delete_multiple_integrations(
     delete_all = (docker_name.lower().strip() == "all")
 
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
 
         for iid in integration_ids:
 
@@ -368,21 +373,21 @@ def get_all_integrations(
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
     profile_name: Optional[str] = Query(None, description="Single or comma-separated values"),
-    search: Optional[str] = Query(None),
-    page: Any = Query(1),
-    limit: Any = Query(50),
+    search_key: Optional[str] = Query(None),
+    page_no: Any = Query(1),
+    page_size: Any = Query(50),
 ):
     """Get integrations with multi-select profile_name, search, and docker_name='all' support."""
 
     # Convert to int
     try:
-        page = int(page)
-        limit = int(limit)
+        page_no = int(page_no)
+        page_size = int(page_size)
     except Exception:
-        raise HTTPException(status_code=422, detail="page and limit must be integers")
+        raise HTTPException(status_code=422, detail="page_no and page_size must be integers")
 
-    if page < 1 or limit < 1:
-        raise HTTPException(status_code=422, detail="page & limit must be >= 1")
+    if page_no < 1 or page_size < 1:
+        raise HTTPException(status_code=422, detail="page_no & page_size must be >= 1")
 
     where_clauses = []
     params: List[Any] = []
@@ -408,13 +413,13 @@ def get_all_integrations(
     # ----------------------------------
     # 3️⃣ Search Filter
     # ----------------------------------
-    if search:
+    if search_key:
         where_clauses.append("LOWER(i.destination_name) LIKE %s")
-        params.append(f"%{search.lower()}%")
+        params.append(f"%{search_key.lower()}%")
 
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
-    offset = (page - 1) * limit
+    offset = (page_no - 1) * page_size
 
     sql = f"""
         SELECT 
@@ -437,14 +442,14 @@ def get_all_integrations(
 
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
-        cursor.execute(sql, tuple(params + [limit, offset]))
+        cursor.execute(sql, tuple(params + [page_size, offset]))
         rows = cursor.fetchall() or []
         cursor.close()
 
     return {
         "total": len(rows),
-        "page": page,
-        "limit": limit,
+        "page": page_no,
+        "limit": page_size,
         "items": rows,
     }
 
@@ -463,7 +468,7 @@ def get_integration(
 ):
 
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
         cursor.execute(
             """
             SELECT i.*, p.name AS profile_name, p.type AS profile_type, p.docker_name AS profile_docker
@@ -483,7 +488,6 @@ def get_integration(
     # NEW: allow docker_name = "all"
     # ─────────────────────────────────────────────
     if docker_name.lower().strip() != "all":
-        # enforce strict match
         if row["profile_docker"] != docker_name:
             raise HTTPException(status_code=403, detail="docker_name mismatch")
 

@@ -64,8 +64,8 @@ async def create_profile(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    Search_key: Optional[str] = Query(None),
-    isSelectAll: bool = Query(False),
+    search_key: Optional[str] = Query(None),
+    is_select_all: bool = Query(False),
     p: profile_models.ProfileIn = Body(...),
 ):
 
@@ -73,7 +73,7 @@ async def create_profile(
     pid = str(uuid.uuid4())
 
     device_ids_input = p.device_ids or []
-    Search_key_clean = (Search_key or "").strip()
+    search_key_clean = (search_key or "").strip()
     final_device_ids = set()
 
     # --------------------------------------------------------------------
@@ -90,7 +90,7 @@ async def create_profile(
                 (p.name.strip(), docker_name),
             )
             dup = cursor.fetchone()
-            cursor.fetchall()  # ★ Prevent unread-result
+            cursor.fetchall()  # OK here because SELECT returns a result set
             cursor.close()
 
             if dup:
@@ -121,20 +121,20 @@ async def create_profile(
     # --------------------------------------------------------------------
     # CASE 1
     # --------------------------------------------------------------------
-    if device_ids_input and not isSelectAll:
+    if device_ids_input and not is_select_all:
         case = "device_ids_only"
         final_device_ids.update(device_ids_input)
 
     # --------------------------------------------------------------------
     # CASE 2
     # --------------------------------------------------------------------
-    elif device_ids_input and isSelectAll and Search_key_clean != "":
+    elif device_ids_input and is_select_all and search_key_clean != "":
         case = "device_ids_plus_springboot"
 
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 spring_url,
-                params={"Search_key": Search_key_clean, "isSelectAll": True},
+                params={"search_key": search_key_clean, "is_select_all": True},
             )
 
         data = resp.json()
@@ -143,13 +143,13 @@ async def create_profile(
     # --------------------------------------------------------------------
     # CASE 3
     # --------------------------------------------------------------------
-    elif isSelectAll and Search_key_clean != "":
+    elif is_select_all and search_key_clean != "":
         case = "springboot_only"
 
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 spring_url,
-                params={"Search_key": Search_key_clean, "isSelectAll": True},
+                params={"search_key": search_key_clean, "is_select_all": True},
             )
 
         data = resp.json()
@@ -158,13 +158,13 @@ async def create_profile(
     # --------------------------------------------------------------------
     # CASE 4
     # --------------------------------------------------------------------
-    elif isSelectAll and Search_key_clean == "":
+    elif is_select_all and search_key_clean == "":
         case = "select_all_no_search"
 
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 spring_url,
-                params={"isSelectAll": True},
+                params={"is_select_all": True},
             )
 
         data = resp.json()
@@ -185,6 +185,7 @@ async def create_profile(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(buffered=True)
 
+            # INSERT profile (OK now – removed fetchall)
             cursor.execute(
                 """
                 INSERT INTO syslog_profiles 
@@ -193,8 +194,8 @@ async def create_profile(
                 """,
                 (pid, p.name, p.type, docker_name, prio_json, fac_json, kws_json),
             )
-            cursor.fetchall()  # ★ Consume metadata
 
+            # INSERT devices (OK now – removed fetchall)
             for dev_id in final_ids_list:
                 rid = str(uuid.uuid4())
                 cursor.execute(
@@ -205,7 +206,6 @@ async def create_profile(
                     """,
                     (rid, pid, dev_id),
                 )
-                cursor.fetchall()  # ★ Avoid unread result
 
             cnx.commit()
             cursor.close()
@@ -244,7 +244,7 @@ async def update_profile(
 
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor(dictionary=True)
+            cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
 
             # ------------------------------
             # Fetch existing profile
@@ -362,7 +362,7 @@ async def delete_multiple_profiles(
 
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor(dictionary=True)
+            cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
             delete_all = (docker_name.lower().strip() == "all")
 
             for pid in body.profile_ids:
@@ -481,9 +481,7 @@ async def delete_all_profiles(
     }
 
 
-# ─────────────────────────────
-# GET ALL PROFILES
-# ─────────────────────────────
+
 # ─────────────────────────────
 # GET ALL PROFILES  (with device_count)
 # ─────────────────────────────
@@ -496,9 +494,9 @@ def get_all_profiles(
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
     profile_type: Optional[str] = Query(None, description="Single or comma-separated values"),
-    search: Optional[str] = Query(None),
-    page: Any = Query(1),
-    limit: Any = Query(50),
+    search_key: Optional[str] = Query(None),
+    page_no: Any = Query(1),
+    page_size: Any = Query(50),
 ):
     """
     List profiles + device_count.
@@ -514,15 +512,15 @@ def get_all_profiles(
 
     # Pagination checks
     try:
-        page = int(page)
-        limit = int(limit)
+        page_no = int(page_no)
+        page_size = int(page_size)
     except:
         raise HTTPException(status_code=422, detail="page and limit must be integers")
 
-    if page < 1 or limit < 1:
+    if page_no < 1 or page_size < 1:
         raise HTTPException(status_code=422, detail="page and limit must be >= 1")
 
-    offset = (page - 1) * limit
+    offset = (page_no - 1) * page_size
 
     # WHERE clauses
     where_clauses = []
@@ -541,9 +539,9 @@ def get_all_profiles(
         params.extend(type_list)
 
     # 3. name search
-    if search:
+    if search_key:
         where_clauses.append("LOWER(p.name) LIKE %s")
-        params.append(f"%{search.lower().strip()}%")
+        params.append(f"%{search_key.lower().strip()}%")
 
     where_sql = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -571,14 +569,14 @@ def get_all_profiles(
 
     with get_db_connection() as cnx:
         cursor = cnx.cursor(dictionary=True)
-        cursor.execute(sql, tuple(params + [limit, offset]))
+        cursor.execute(sql, tuple(params + [page_size, offset]))
         rows = cursor.fetchall() or []
         cursor.close()
 
     return {
         "total": len(rows),
-        "page": page,
-        "limit": limit,
+        "page_no": page_no,
+        "page_size": page_size,
         "items": rows,
     }
 
@@ -596,29 +594,18 @@ async def get_profile_device_details(
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
     profile_id: str = Path(...),
-    search: str = Query(None),
-    pageno: int = Query(1),
-    pagesize: int = Query(100),
+    search_key: str = Query(None),
+    page_no: int = Query(1),
+    page_size: int = Query(100),
 ):
-    """
-    Fetch device_details for a profile.
-    Now also returns asset_count = total devices assigned to profile.
-    Fully compatible with NEW SpringBoot response format:
-        [
-            {"id": "...", "status": ..., "display_name": "...", "ip_address": "..."},
-            ...
-        ]
-    """
-
     _validate_docker_name(docker_name)
 
     # --------------------------------------------------------------
-    # 1. Fetch PROFILE & DEVICE IDs
+    # 1. Fetch PROFILE & DEVICE IDs   (buffered=True FIX APPLIED)
     # --------------------------------------------------------------
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIX
 
-        # Validate profile exists
         cursor.execute(
             "SELECT id, docker_name FROM syslog_profiles WHERE id=%s",
             (profile_id,),
@@ -628,7 +615,6 @@ async def get_profile_device_details(
             cursor.close()
             raise HTTPException(status_code=404, detail="Profile not found")
 
-        # Get device ids
         cursor.execute(
             "SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s",
             (profile_id,),
@@ -650,9 +636,9 @@ async def get_profile_device_details(
     # 3. Prepare default response
     # --------------------------------------------------------------
     device_details_response = {
-        "total": asset_count,
-        "pageno": pageno,
-        "pagesize": pagesize,
+        "total": asset_count,   # total devices assigned to profile
+        "page_no": page_no,
+        "page_size": page_size,
         "items": [],
         "asset_count": asset_count,
     }
@@ -677,42 +663,35 @@ async def get_profile_device_details(
                 spring_url,
                 json=device_ids,
                 params={
-                    "pageno": pageno,
-                    "pagesize": pagesize,
-                    "search": search if search else None,
+                    "page_no": page_no,
+                    "page_size": page_size,
+                    "search_key": search_key if search_key else None,
                 },
             )
 
         data = spring_resp.json()
 
         # ----------------------------------------------------------
-        # NEW FORMAT SUPPORT: SpringBoot returns a LIST
+        # NEW FORMAT (LIST): SpringBoot already paginated → DO NOT re-paginate
         # ----------------------------------------------------------
         if isinstance(data, list):
-            # We must apply pagination because SpringBoot is returning full list
-            start = (pageno - 1) * pagesize
-            end = start + pagesize
-            paginated_items = data[start:end]
-
             device_details_response.update({
-                "items": paginated_items,
-                "total": len(data),
+                "items": data,
+                "total": asset_count,   # keep original total
             })
 
         # ----------------------------------------------------------
-        # OLD FORMAT SUPPORT: dict with items
+        # OLD FORMAT: backend sends dict with items + total
         # ----------------------------------------------------------
         elif isinstance(data, dict) and "items" in data:
             device_details_response = data
             device_details_response["asset_count"] = asset_count
 
         else:
-            # Anything unexpected → safe fallback
             device_details_response["items"] = []
 
     except Exception as e:
         logger.error("SpringBoot call failed: %s", e)
-        # still return assigned count
         return device_details_response
 
     return device_details_response
@@ -740,29 +719,23 @@ async def delete_profile_devices(
     profile_id: str = Path(...),
 
     # Query params (NOT inside body)
-    isSelectAll: bool = Query(False, description="If true, delete all or filtered"),
-    Search_key: Optional[str] = Query(None, description="Filter keyword for SpringBoot filtering"),
+    is_select_all: bool = Query(False, description="If true, delete all or filtered"),
+    search_key: Optional[str] = Query(None, description="Filter keyword for SpringBoot filtering"),
 
     # Body expecting: { "device_ids": [...] }
     body: DeviceDeleteBody = Body(default=DeviceDeleteBody()),
 ):
     """
-    Delete devices from a profile, updated for new endpoint /getalldeviceids:
-
-      CASE 1: body.device_ids → delete exactly those IDs
-      CASE 2: isSelectAll=true AND no Search_key → delete ALL devices from profile
-      CASE 3: isSelectAll=true AND Search_key → delete only devices returned by SpringBoot /getalldeviceids
-      CASE 4: nothing provided → no-op
+    Delete devices from a profile.
     """
 
-    # Normalize device_ids from BODY
     device_ids_input = [d.strip() for d in (body.device_ids or []) if d and d.strip()]
 
     # -------------------------------------------
     # Validate profile exists + get docker_name
     # -------------------------------------------
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
         cursor.execute(
             "SELECT docker_name FROM syslog_profiles WHERE id=%s",
             (profile_id,),
@@ -775,9 +748,6 @@ async def delete_profile_devices(
 
     profile_docker = row["docker_name"]
 
-    # -------------------------------------------
-    # Docker validation unless docker="all"
-    # -------------------------------------------
     if docker_name.lower().strip() != "all":
         if profile_docker != docker_name:
             raise HTTPException(status_code=403, detail="docker_name mismatch")
@@ -786,7 +756,7 @@ async def delete_profile_devices(
     # Fetch current devices in profile
     # -------------------------------------------
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
         cursor.execute(
             "SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s",
             (profile_id,),
@@ -800,28 +770,18 @@ async def delete_profile_devices(
     deleted = set()
     skipped = set()
 
-    # ----------------------------------------------------------------
-    # CASE 1 → BODY contains device_ids → delete EXACTLY those IDs
-    # ----------------------------------------------------------------
+    # ---------------- CASES --------------------
     if device_ids_input:
         case = "device_ids_only"
         requested = set(device_ids_input)
         deleted = current_devices & requested
         skipped = requested - current_devices
 
-    # ----------------------------------------------------------------
-    # CASE 2 → isSelectAll=true & Search_key empty → DELETE ALL
-    # ----------------------------------------------------------------
-    elif isSelectAll and not Search_key:
+    elif is_select_all and not search_key:
         case = "select_all"
         deleted = current_devices
-        skipped = set()
 
-    # ----------------------------------------------------------------
-    # CASE 3 → isSelectAll=true & Search_key provided
-    #         NEW LOGIC: call /getalldeviceids → returns list[str]
-    # ----------------------------------------------------------------
-    elif isSelectAll and Search_key:
+    elif is_select_all and search_key:
         case = "search_and_select_all"
 
         spring_url = (
@@ -833,12 +793,8 @@ async def delete_profile_devices(
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     spring_url,
-                    params={
-                        "Search_key": Search_key,
-                        "isSelectAll": True
-                    },
+                    params={"search_key": search_key, "is_select_all": True},
                 )
-            # Response is: ["266932", "266933"]
             spring_ids = set(resp.json())
 
         except Exception as e:
@@ -847,13 +803,9 @@ async def delete_profile_devices(
                 "details": str(e),
             }
 
-        # intersection = delete only those present in profile
         deleted = current_devices & spring_ids
         skipped = spring_ids - current_devices
 
-    # ----------------------------------------------------------------
-    # CASE 4 → NOTHING provided
-    # ----------------------------------------------------------------
     else:
         case = "none"
         deleted = set()
@@ -864,7 +816,7 @@ async def delete_profile_devices(
     # -------------------------------------------
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor()
+            cursor = cnx.cursor(buffered=True)  # ★ FIXED
 
             for dev in deleted:
                 cursor.execute(
@@ -922,7 +874,7 @@ async def add_devices_to_profile(
 
     # 1 Validate profile_id exists & belongs to docker_name (unless docker='all')
     with get_db_connection() as cnx:
-        cursor = cnx.cursor(dictionary=True)
+        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
 
         cursor.execute(
             "SELECT id, docker_name FROM syslog_profiles WHERE id=%s",

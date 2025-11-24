@@ -15,7 +15,7 @@ class ProfileDeviceDeleteRequest(BaseModel):
     )
     search: Optional[str] = Field(
         default="",
-        description="Search keyword for SpringBoot lookup"
+        description="search keyword for SpringBoot lookup"
     )
     select: Optional[str] = Field(
         default="",

@@ -33,13 +33,12 @@ def list_incidents(
     delete_all = (docker_name.lower().strip() == "all")
 
     # ========================================================
-    # Validate device_id belongs to this docker_name  
-    # Skip validation if docker_name == "all"
+    # Validate device_id belongs to this docker_name
     # ========================================================
     if not delete_all:
         try:
             with get_db_connection() as cnx:
-                cursor = cnx.cursor(dictionary=True)
+                cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
                 cursor.execute(
                     """
                     SELECT p.docker_name
@@ -64,7 +63,7 @@ def list_incidents(
             logger.exception("docker_name validation failed: %s", e)
             raise HTTPException(status_code=500, detail="Error validating docker_name")
 
-    # Convert page, limit to int
+    # Validate page and limit
     try:
         page = int(page)
         limit = int(limit)
@@ -74,7 +73,7 @@ def list_incidents(
     if page < 1 or limit < 1:
         raise HTTPException(status_code=422, detail="page and limit must be >= 1")
 
-    # Convert filters to int
+    # Convert optional filters
     def convert_optional_int(value):
         if value is None:
             return None
@@ -128,7 +127,7 @@ def list_incidents(
         """
 
         with get_db_connection() as cnx:
-            cursor = cnx.cursor(dictionary=True)
+            cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
 
             cursor.execute(sql_count, tuple(params))
             total = cursor.fetchone()["cnt"]

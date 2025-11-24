@@ -37,12 +37,14 @@ def get_devices_by_type(
             detail="profile_type must be exactly 'internal' or 'external'",
         )
 
-    # STRICT VALIDATION: docker_name (NO 'all')
     docker_clean = docker_name.strip()
 
+    # ---------------------------------------
+    # Validate docker_name exists
+    # ---------------------------------------
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor()
+            cursor = cnx.cursor(buffered=True)  # ★ FIXED
             cursor.execute(
                 "SELECT 1 FROM syslog_profiles WHERE docker_name = %s LIMIT 1",
                 (docker_clean,),
@@ -75,7 +77,7 @@ def get_devices_by_type(
 
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor()
+            cursor = cnx.cursor(buffered=True)  # ★ FIXED
             cursor.execute(sql, params)
             rows = [r[0] for r in cursor.fetchall() or []]
             cursor.close()
@@ -83,7 +85,6 @@ def get_devices_by_type(
         logger.exception("get_devices_by_type failed: %s", e)
         raise HTTPException(status_code=500, detail="DB error fetching devices")
 
-    # FINAL MINIMAL RESPONSE
     return {
         "device_ids": rows
     }

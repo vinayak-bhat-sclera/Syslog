@@ -25,21 +25,58 @@ _SNAPSHOT_INTERVAL_SECONDS = getattr(settings, "CACHE_SNAPSHOT_INTERVAL_SECONDS"
 
 
 async def _fetch_from_springboot(ip: str) -> Optional[str]:
-    url = f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}/api/device/by-ip/{ip}"
+    """
+    Correct lookup for device_id by IP.
+    Calls the real SpringBoot endpoint:
+    /docker/{docker_name}/getalldeviceids
+    """
+
+    # STEP 1 — determine docker_name for this IP
+    docker_name = None
     try:
-        timeout = aiohttp.ClientTimeout(total=3)
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT p.docker_name 
+                FROM syslog_profiles p
+                JOIN syslog_profile_devices pd ON p.id = pd.profile_id
+                WHERE pd.ip_address = %s
+            """, (ip,))
+            row = cursor.fetchone()
+            cursor.close()
+
+            if row:
+                docker_name = row["docker_name"]
+    except Exception:
+        logger.exception("Failed to determine docker_name for IP %s", ip)
+
+    if not docker_name:
+        logger.warning("No docker_name found for IP %s", ip)
+        return None
+
+    url = f"http://{settings.SPRINGBOOT_HOST}:{settings.SPRINGBOOT_PORT}/docker/{docker_name}/getalldeviceids"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    device_id = data.get("device_id") or data.get("deviceId") or data.get("id")
-                    if device_id:
-                        return device_id
-                else:
+                if resp.status != 200:
                     text = await resp.text()
-                    logger.warning("SpringBoot lookup failed (%s): %s -> %s", resp.status, url, text[:200])
+                    logger.warning("SpringBoot GET failed (%s): %s -> %s",
+                                   resp.status, url, text[:300])
+                    return None
+
+                data = await resp.json()
+
+                # STEP 2 — find our IP
+                for item in data:
+                    ip_addr = item.get("ip_address")
+                    if ip_addr == ip:
+                        return item.get("id")
+
     except Exception as e:
         logger.exception("SpringBoot lookup error for %s: %s", ip, e)
+
     return None
 
 
@@ -161,25 +198,37 @@ async def _fetch_mappings_from_springboot_for_device_ids(device_ids: List[str], 
 
     return result
 
+#fetchone()changes have been added here 
 
 async def refresh_cache_for_profile(profile_id: str) -> None:
-    #from app.db import get_db_connection
 
     device_ids = []
     docker_name = None
     try:
         with get_db_connection() as cnx:
-            cursor = cnx.cursor(dictionary=True)
-            cursor.execute("SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s", (profile_id,))
+            cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
+
+            cursor.execute(
+                "SELECT device_id FROM syslog_profile_devices WHERE profile_id=%s",
+                (profile_id,),
+            )
             rows = cursor.fetchall() or []
             device_ids = [r["device_id"] for r in rows if r.get("device_id")]
-            cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (profile_id,))
+
+            cursor.execute(
+                "SELECT docker_name FROM syslog_profiles WHERE id=%s",
+                (profile_id,),
+            )
             p = cursor.fetchone()
             cursor.close()
+
             if p:
-                docker_name = p.get("docker_name")  # EXACT casing preserved
+                docker_name = p.get("docker_name")  # preserve exact casing
     except Exception:
-        logger.exception("Error fetching profile devices or docker_name for refresh for profile %s", profile_id)
+        logger.exception(
+            "Error fetching profile devices or docker_name for refresh for profile %s",
+            profile_id
+        )
         return
 
     prev_set = _PROFILE_DEVICE_MAP.get(profile_id, set())
@@ -189,7 +238,10 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
         logger.info("No device_ids found for profile %s; nothing to refresh", profile_id)
         return
 
-    mappings = await _fetch_mappings_from_springboot_for_device_ids(device_ids, docker_name=docker_name)
+    mappings = await _fetch_mappings_from_springboot_for_device_ids(
+        device_ids, docker_name=docker_name
+    )
+
     if not mappings:
         logger.info("No mappings returned from springboot for profile %s", profile_id)
         return
@@ -198,8 +250,10 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
     async with _CACHE_LOCK:
         for ip, did in mappings.items():
             _DEVICE_CACHE[ip] = (did, now + CACHE_TTL)
-            logger.info("[DEVICE_CACHE REFRESH - PROFILE] %s -> %s (profile=%s ttl=%ds)", ip, did, profile_id, CACHE_TTL)
-
+            logger.info(
+                "[DEVICE_CACHE REFRESH - PROFILE] %s -> %s (profile=%s ttl=%ds)",
+                ip, did, profile_id, CACHE_TTL
+            )
 
 async def refresh_all_profiles_cache() -> None:
     #from app.db import get_db_connection
