@@ -346,139 +346,238 @@ async def delete_multiple_profiles(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    body: ProfileDeleteRequest = Body(...),
+
+    # REQUIRED QUERY PARAMS
+    search_key: str = Query("", description="Search profiles by name (prefix match)"),
+    is_select_all: bool = Query(False),
+    profile_type: str = Query("", description="Filter by internal|external"),
+
+    # BODY: only profile_ids list
+    body: dict = Body(default={}),
 ):
     """
-    Delete multiple profiles by IDs.
+    Enhanced deletion logic for profiles.
 
-    docker_name = "all" → delete ALL provided profile_ids (no docker filter)
-    otherwise → delete only profiles from that docker_name
+    SUPPORTED CASES:
+    1. profile_ids[] ONLY → delete exactly those profiles.
+    2. is_select_all=true → delete ALL profiles in docker_name (or all if docker='all').
+    3. search_key + is_select_all=true → delete profiles whose name starts with search_key.
+    4. profile_type + is_select_all=true → delete profiles filtered by type.
+    5. profile_type + search_key + is_select_all=true → delete profiles matching both filters.
     """
-    if not body.profile_ids:
-        raise HTTPException(status_code=422, detail="profile_ids list cannot be empty")
+
+    docker_clean = docker_name.lower().strip()
+    docker_all = (docker_clean == "all")
+
+    profile_ids = body.get("profile_ids", [])
+    search_key = search_key.strip()
+    profile_type = profile_type.strip().lower()
 
     deleted = []
     skipped = []
 
-    try:
-        with get_db_connection() as cnx:
-            cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
-            delete_all = (docker_name.lower().strip() == "all")
+    # Allowed types
+    valid_types = ("internal", "external")
+    if profile_type and profile_type not in valid_types:
+        raise HTTPException(status_code=422, detail="profile_type must be 'internal' or 'external'")
 
-            for pid in body.profile_ids:
-                cursor.execute("SELECT docker_name FROM syslog_profiles WHERE id=%s", (pid,))
-                row = cursor.fetchone()
+    # -------------------------------------------------------------------
+    # CASE 1 — profile_ids[] provided & is_select_all = False
+    # -------------------------------------------------------------------
+    if profile_ids and not is_select_all:
+        try:
+            with get_db_connection() as cnx:
+                cursor = cnx.cursor(buffered=True, dictionary=True)
 
-                if not row:
-                    skipped.append(pid)
-                    continue
+                for pid in profile_ids:
+                    cursor.execute(
+                        "SELECT docker_name FROM syslog_profiles WHERE id=%s",
+                        (pid,),
+                    )
+                    row = cursor.fetchone()
 
-                if not delete_all and row["docker_name"] != docker_name:
-                    skipped.append(pid)
-                    continue
+                    if not row:
+                        skipped.append(pid)
+                        continue
 
-                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
-                cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
-                cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
-                deleted.append(pid)
+                    # docker validation (unless docker="all")
+                    if not docker_all and row["docker_name"] != docker_name:
+                        skipped.append(pid)
+                        continue
 
-            cnx.commit()
-            cursor.close()
-
-        for pid in deleted:
-            asyncio.create_task(notify_profile_change(pid))
-
-    except Exception as e:
-        logger.exception("Bulk delete profiles failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {
-        "status": "success",
-        "deleted_ids": deleted,
-        "skipped_ids": skipped,
-        "mode": "all-dockers" if delete_all else "single-docker",
-    }
-
-
-# ─────────────────────────────
-# DELETE ALL PROFILES FOR A DOCKER
-# ─────────────────────────────
-@router.delete(
-    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/delete/all",
-    status_code=status.HTTP_200_OK,
-)
-async def delete_all_profiles(
-    username: str = Path(...),
-    vdmsid: str = Path(...),
-    docker_name: str = Path(...),
-):
-    """
-    Deletes ALL profiles (and their devices + integrations).
-
-    Modes:
-    docker_name == "all" → delete EVERYTHING across all dockers.
-    specific docker_name → delete only profiles belonging to that docker.
-    """
-    deleted_ids = []
-
-    try:
-        with get_db_connection() as cnx:
-            cursor = cnx.cursor(dictionary=True)
-
-            # MODE 1: delete EVERYTHING
-            if docker_name.lower().strip() == "all":
-                cursor.execute("SELECT id FROM syslog_profiles")
-                rows = cursor.fetchall() or []
-                profile_ids = [r["id"] for r in rows]
-
-                if profile_ids:
-                    cursor.execute("DELETE FROM syslog_integration")
-                    cursor.execute("DELETE FROM syslog_profile_devices")
-                    cursor.execute("DELETE FROM syslog_profiles")
+                    # DELETE LINKED ENTRIES
+                    cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+                    cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
+                    cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
+                    deleted.append(pid)
 
                 cnx.commit()
                 cursor.close()
 
-                for pid in profile_ids:
-                    asyncio.create_task(notify_profile_change(pid))
+            return {
+                "status": "success",
+                "deleted_ids": deleted,
+                "skipped_ids": skipped,
+                "mode": "all-dockers" if docker_all else "single-docker",
+            }
 
-                return {
-                    "status": "deleted_all",
-                    "count": len(profile_ids),
-                    "deleted_ids": profile_ids,
-                    "docker_name": "all",
-                }
+        except Exception as e:
+            logger.exception("Bulk delete profiles failed")
+            raise HTTPException(status_code=500, detail=str(e))
 
-            # MODE 2: delete only specific docker
-            cursor.execute(
-                "SELECT id FROM syslog_profiles WHERE docker_name=%s",
-                (docker_name,),
-            )
-            rows = cursor.fetchall() or []
-            profile_ids = [r["id"] for r in rows]
+    # -------------------------------------------------------------------
+    # CASE 2 — All OTHER scenarios require is_select_all = True
+    # -------------------------------------------------------------------
+    if not is_select_all:
+        raise HTTPException(
+            status_code=422,
+            detail="Either provide profile_ids[] or set is_select_all=true",
+        )
 
-            for pid in profile_ids:
-                cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
-                cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
-                cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
-                deleted_ids.append(pid)
+    # -------------------------------------------------------------------
+    # BUILD FILTERS for search_key + profile_type
+    # -------------------------------------------------------------------
+    where_clauses = []
+    params = []
 
-            cnx.commit()
+    # docker filter unless docker=='all'
+    if not docker_all:
+        where_clauses.append("docker_name = %s")
+        params.append(docker_name)
+
+    # filter by type
+    if profile_type:
+        where_clauses.append("type = %s")
+        params.append(profile_type)
+
+    # prefix search
+    if search_key:
+        where_clauses.append("name LIKE %s")
+        params.append(search_key + "%")
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    # -------------------------------------------------------------------
+    # FETCH profiles that match filters
+    # -------------------------------------------------------------------
+    with get_db_connection() as cnx:
+        cursor = cnx.cursor(buffered=True, dictionary=True)
+
+        cursor.execute(
+            f"SELECT id FROM syslog_profiles {where_sql}",
+            tuple(params),
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
             cursor.close()
+            return {
+                "status": "success",
+                "deleted_ids": [],
+                "skipped_ids": [],
+                "message": "No profiles matched filters",
+            }
 
-        for pid in deleted_ids:
-            asyncio.create_task(notify_profile_change(pid))
+        ids_to_delete = [r["id"] for r in rows]
 
-    except Exception as e:
-        logger.exception("delete_all_profiles failed")
-        raise HTTPException(status_code=400, detail=str(e))
+        # DELETE ALL MATCHED PROFILES
+        for pid in ids_to_delete:
+            cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+            cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
+            cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
+            deleted.append(pid)
+
+        cnx.commit()
+        cursor.close()
 
     return {
-        "status": "deleted_all",
-        "count": len(deleted_ids),
-        "deleted_ids": deleted_ids,
-        "docker_name": docker_name,
+        "status": "success",
+        "deleted_ids": deleted,
+        "skipped_ids": [],
+        "mode": "all-dockers" if docker_all else "single-docker",
     }
+
+# ─────────────────────────────
+# DELETE ALL PROFILES FOR A DOCKER
+# ─────────────────────────────
+# @router.delete(
+#     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/delete/all",
+#     status_code=status.HTTP_200_OK,
+# )
+# async def delete_all_profiles(
+#     username: str = Path(...),
+#     vdmsid: str = Path(...),
+#     docker_name: str = Path(...),
+# ):
+#     """
+#     Deletes ALL profiles (and their devices + integrations).
+
+#     Modes:
+#     docker_name == "all" → delete EVERYTHING across all dockers.
+#     specific docker_name → delete only profiles belonging to that docker.
+#     """
+#     deleted_ids = []
+
+#     try:
+#         with get_db_connection() as cnx:
+#             cursor = cnx.cursor(dictionary=True)
+
+#             # MODE 1: delete EVERYTHING
+#             if docker_name.lower().strip() == "all":
+#                 cursor.execute("SELECT id FROM syslog_profiles")
+#                 rows = cursor.fetchall() or []
+#                 profile_ids = [r["id"] for r in rows]
+
+#                 if profile_ids:
+#                     cursor.execute("DELETE FROM syslog_integration")
+#                     cursor.execute("DELETE FROM syslog_profile_devices")
+#                     cursor.execute("DELETE FROM syslog_profiles")
+
+#                 cnx.commit()
+#                 cursor.close()
+
+#                 for pid in profile_ids:
+#                     asyncio.create_task(notify_profile_change(pid))
+
+#                 return {
+#                     "status": "deleted_all",
+#                     "count": len(profile_ids),
+#                     "deleted_ids": profile_ids,
+#                     "docker_name": "all",
+#                 }
+
+#             # MODE 2: delete only specific docker
+#             cursor.execute(
+#                 "SELECT id FROM syslog_profiles WHERE docker_name=%s",
+#                 (docker_name,),
+#             )
+#             rows = cursor.fetchall() or []
+#             profile_ids = [r["id"] for r in rows]
+
+#             for pid in profile_ids:
+#                 cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
+#                 cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
+#                 cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
+#                 deleted_ids.append(pid)
+
+#             cnx.commit()
+#             cursor.close()
+
+#         for pid in deleted_ids:
+#             asyncio.create_task(notify_profile_change(pid))
+
+#     except Exception as e:
+#         logger.exception("delete_all_profiles failed")
+#         raise HTTPException(status_code=400, detail=str(e))
+
+#     return {
+#         "status": "deleted_all",
+#         "count": len(deleted_ids),
+#         "deleted_ids": deleted_ids,
+#         "docker_name": docker_name,
+#     }
 
 
 
@@ -709,7 +808,7 @@ async def get_profile_device_details(
 # ==================================================
 
 @router.post(
-    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/devices",
+    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/devices/delete",
     status_code=200,
 )
 async def delete_profile_devices(

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import json
 import uuid
+import inspect
 from typing import Any, Dict, List, Tuple, Optional
 
 from app.services.syslog_parser import parse_syslog_line
@@ -147,18 +148,43 @@ async def start_udp_server():
                             logger.exception("DB insert error for profile %s", prof_id)
 
                     else:
-                        # EXTERNAL → forward ALWAYS (unchanged)
+                        # EXTERNAL → forward ALWAYS (unchanged), but schedule safely
                         integrations = get_integrations_for_profile(prof_id)
                         if not integrations:
                             logger.info("External profile %s has no integrations", prof_id)
 
                         for integ in integrations:
                             try:
-                                forward_to_integration(integ, parsed)
-                                did_forward = True
+                                # If forward_to_integration is async, schedule it as a task.
+                                # If it's sync/blocking, run it in executor to avoid blocking the loop.
+                                if inspect.iscoroutinefunction(forward_to_integration):
+                                    # schedule coroutine, do not await here
+                                    asyncio.create_task(forward_to_integration(integ, parsed))
+                                    did_forward = True
+                                    logger.info(
+                                        "Scheduled async forward for profile %s -> integration %s (%s:%s)",
+                                        prof_id,
+                                        integ.get("id"),
+                                        integ.get("ip_address"),
+                                        integ.get("port"),
+                                    )
+                                else:
+                                    # schedule sync function in threadpool
+                                    loop.run_in_executor(None, forward_to_integration, integ, parsed)
+                                    did_forward = True
+                                    logger.info(
+                                        "Scheduled sync forward for profile %s -> integration %s (%s:%s) in executor",
+                                        prof_id,
+                                        integ.get("id"),
+                                        integ.get("ip_address"),
+                                        integ.get("port"),
+                                    )
                             except Exception:
-                                logger.exception("Forwarding failed for profile %s integration %s",
-                                                 prof_id, integ.get("id"))
+                                logger.exception(
+                                    "Forwarding scheduling failed for profile %s integration %s",
+                                    prof_id,
+                                    integ.get("id"),
+                                )
 
                 if not did_store:
                     logger.debug("No internal incidents stored for device %s", device_id)

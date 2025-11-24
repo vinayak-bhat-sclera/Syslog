@@ -47,16 +47,42 @@ def create_integration(
     # Validate the profile belongs to this docker_name
     _validate_docker_name_for_profile(i.profile_id, docker_name)
 
-    # STRICT ENFORCEMENT: ensure profile_id is not used under another docker
+    # -------------------------------------------------------
+    # NEW VALIDATION: destination_name must be unique per docker
+    # -------------------------------------------------------
     with get_db_connection() as cnx:
-        cursor = cnx.cursor()
+        cursor = cnx.cursor(buffered=True, dictionary=True)
+        cursor.execute(
+            """
+            SELECT id 
+            FROM syslog_integration
+            WHERE LOWER(destination_name) = LOWER(%s)
+              AND docker_name = %s
+            """,
+            (i.destination_name.strip(), docker_name),
+        )
+        existing = cursor.fetchone()
+        cursor.close()
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"destination_name '{i.destination_name}' already exists"
+        )
+
+    # -------------------------------------------------------
+    # STRICT ENFORCEMENT (existing logic)
+    # Check that same profile_id is not used under another docker
+    # -------------------------------------------------------
+    with get_db_connection() as cnx:
+        cursor = cnx.cursor(buffered=True)
         cursor.execute(
             """
             SELECT docker_name 
             FROM syslog_integration 
             WHERE profile_id = %s
             """,
-            (i.profile_id,)
+            (i.profile_id,),
         )
         rows = cursor.fetchall()
         cursor.close()
@@ -68,15 +94,17 @@ def create_integration(
                 detail=(
                     f"Profile ID '{i.profile_id}' is already used under docker '{existing_docker}'. "
                     f"Cannot reuse it under '{docker_name}'."
-                )
+                ),
             )
 
+    # -------------------------------------------------------
+    # CREATE INTEGRATION
+    # -------------------------------------------------------
     iid = str(uuid.uuid4())
 
     try:
         with get_db_connection() as cnx:
             cursor = cnx.cursor()
-
             cursor.execute(
                 """
                 INSERT INTO syslog_integration 
@@ -235,41 +263,132 @@ def delete_multiple_integrations(
     username: str = Path(...),
     vdmsid: str = Path(...),
     docker_name: str = Path(...),
-    body: Dict[str, List[str]] = Body(..., description="Body with integration_ids list"),
-):
-    integration_ids = body.get("integration_ids")
 
-    if not integration_ids or not isinstance(integration_ids, list):
-        raise HTTPException(status_code=422, detail="integration_ids must be a non-empty list")
+    # NEW QUERY PARAMS
+    search_key: Optional[str] = Query(None, description="Prefix match on destination_name"),
+    profile_name: Optional[str] = Query(None, description="Filter by profile name"),
+    is_select_all: bool = Query(False, description="Enable bulk delete mode"),
+
+    # BODY → integration_ids
+    body: Dict[str, Any] = Body(..., description="integration_ids list"),
+):
+    integration_ids = body.get("integration_ids", [])
+    docker_clean = docker_name.lower().strip()
+    docker_all = (docker_clean == "all")
 
     deleted = []
     not_found = []
-    mismatched = []
+    docker_mismatch = []
 
-    delete_all = (docker_name.lower().strip() == "all")
+    # -------------------------------------------------------------
+    # CASE A — Delete exactly integration_ids[]
+    # -------------------------------------------------------------
+    if integration_ids and not is_select_all:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(buffered=True, dictionary=True)
+            for iid in integration_ids:
 
-    with get_db_connection() as cnx:
-        cursor = cnx.cursor(buffered=True, dictionary=True)  # ★ FIXED
+                cursor.execute(
+                    """
+                    SELECT i.id, i.profile_id, p.docker_name
+                    FROM syslog_integration i
+                    JOIN syslog_profiles p ON p.id = i.profile_id
+                    WHERE i.id=%s
+                    """,
+                    (iid,),
+                )
+                row = cursor.fetchone()
 
-        for iid in integration_ids:
-
-            # Check if integration exists
-            cursor.execute("SELECT profile_id FROM syslog_integration WHERE id=%s", (iid,))
-            row = cursor.fetchone()
-
-            if not row:
-                not_found.append(iid)
-                continue
-
-            # If NOT "all", validate docker_name matches
-            if not delete_all:
-                try:
-                    _validate_docker_name_for_profile(row["profile_id"], docker_name)
-                except HTTPException:
-                    mismatched.append(iid)
+                if not row:
+                    not_found.append(iid)
                     continue
 
-            # Delete the integration
+                # docker validation unless docker="all"
+                if not docker_all and row["docker_name"] != docker_name:
+                    docker_mismatch.append(iid)
+                    continue
+
+                cursor.execute("DELETE FROM syslog_integration WHERE id=%s", (iid,))
+                deleted.append(iid)
+
+            cnx.commit()
+            cursor.close()
+
+        return {
+            "status": "completed",
+            "mode": "all-dockers" if docker_all else "single-docker",
+            "deleted": deleted,
+            "not_found": not_found,
+            "docker_mismatch": docker_mismatch,
+        }
+
+    # -------------------------------------------------------------
+    # ANY OTHER CASE needs is_select_all=true
+    # -------------------------------------------------------------
+    if not is_select_all:
+        raise HTTPException(
+            status_code=422,
+            detail="Either provide integration_ids[] or set is_select_all=true",
+        )
+
+    # -------------------------------------------------------------
+    # BUILD FILTERS for search_key + profile_name
+    # -------------------------------------------------------------
+    filters = []
+    params = []
+
+    # docker filter unless docker_name="all"
+    if not docker_all:
+        filters.append("p.docker_name = %s")
+        params.append(docker_name)
+
+    # prefix search on destination_name
+    if search_key:
+        filters.append("i.destination_name LIKE %s")
+        params.append(search_key + "%")
+
+    # profile_name search
+    if profile_name:
+        filters.append("p.name LIKE %s")
+        params.append(profile_name + "%")
+
+    where_sql = ""
+    if filters:
+        where_sql = "WHERE " + " AND ".join(filters)
+
+    # -------------------------------------------------------------
+    # FETCH MATCHING INTEGRATIONS
+    # -------------------------------------------------------------
+    with get_db_connection() as cnx:
+        cursor = cnx.cursor(buffered=True, dictionary=True)
+
+        cursor.execute(
+            f"""
+            SELECT i.id
+            FROM syslog_integration i
+            JOIN syslog_profiles p ON p.id = i.profile_id
+            {where_sql}
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall() or []
+
+        ids_to_delete = [r["id"] for r in rows]
+
+        if not ids_to_delete:
+            cursor.close()
+            return {
+                "status": "completed",
+                "deleted": [],
+                "not_found": [],
+                "docker_mismatch": [],
+                "message": "No integrations matched filters",
+            }
+
+        # ---------------------------------------------------------
+        # DELETE MATCHED INTEGRATIONS
+        # ---------------------------------------------------------
+        for iid in ids_to_delete:
             cursor.execute("DELETE FROM syslog_integration WHERE id=%s", (iid,))
             deleted.append(iid)
 
@@ -278,87 +397,89 @@ def delete_multiple_integrations(
 
     return {
         "status": "completed",
-        "mode": "all-dockers" if delete_all else "single-docker",
+        "mode": "all-dockers" if docker_all else "single-docker",
         "deleted": deleted,
-        "not_found": not_found,
-        "docker_mismatch": mismatched,
+        "filtered_by": {
+            "search_key": search_key,
+            "profile_name": profile_name,
+        },
     }
 
 
 # ─────────────────────────────
 # DELETE ALL INTEGRATIONS FOR DOCKER
 # ─────────────────────────────
-@router.delete(
-    "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_integrations/delete/all",
-    status_code=status.HTTP_200_OK,
-)
-def delete_all_integrations(
-    username: str = Path(...),
-    vdmsid: str = Path(...),
-    docker_name: str = Path(...)
-):
-    """
-    Delete ALL integrations.
+# @router.delete(
+#     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_integrations/delete/all",
+#     status_code=status.HTTP_200_OK,
+# )
+# def delete_all_integrations(
+#     username: str = Path(...),
+#     vdmsid: str = Path(...),
+#     docker_name: str = Path(...)
+# ):
+#     """
+#     Delete ALL integrations.
 
-    Modes:
-    docker_name == "all"  → Delete ALL integrations globally
-    Specific docker_name   → Delete integrations only for profiles under that docker
-    """
+#     Modes:
+#     docker_name == "all"  → Delete ALL integrations globally
+#     Specific docker_name   → Delete integrations only for profiles under that docker
+#     """
 
-    with get_db_connection() as cnx:
-        cursor = cnx.cursor()
+#     with get_db_connection() as cnx:
+#         cursor = cnx.cursor()
 
-        # ─────────────────────────────
-        # MODE 1: DELETE EVERYTHING
-        # ─────────────────────────────
-        if docker_name.lower().strip() == "all":
-            cursor.execute("DELETE FROM syslog_integration")
-            deleted_count = cursor.rowcount
-            cnx.commit()
-            cursor.close()
+#         # ─────────────────────────────
+#         # MODE 1: DELETE EVERYTHING
+#         # ─────────────────────────────
+#         if docker_name.lower().strip() == "all":
+#             cursor.execute("DELETE FROM syslog_integration")
+#             deleted_count = cursor.rowcount
+#             cnx.commit()
+#             cursor.close()
 
-            return {
-                "status": "completed",
-                "deleted": deleted_count,
-                "docker_name": "all"
-            }
+#             return {
+#                 "status": "completed",
+#                 "deleted": deleted_count,
+#                 "docker_name": "all"
+#             }
 
-        # ─────────────────────────────
-        # MODE 2: DELETE for specific docker_name
-        # ─────────────────────────────
-        cursor.execute(
-            "SELECT id FROM syslog_profiles WHERE docker_name=%s",
-            (docker_name,)
-        )
-        profiles = [r[0] for r in cursor.fetchall() or []]
+#         # ─────────────────────────────
+#         # MODE 2: DELETE for specific docker_name
+#         # ─────────────────────────────
+#         cursor.execute(
+#             "SELECT id FROM syslog_profiles WHERE docker_name=%s",
+#             (docker_name,)
+#         )
+#         profiles = [r[0] for r in cursor.fetchall() or []]
 
-        if not profiles:
-            cursor.close()
-            return {
-                "status": "completed",
-                "deleted": 0,
-                "detail": f"No integrations found for docker_name '{docker_name}'"
-            }
+#         if not profiles:
+#             cursor.close()
+#             return {
+#                 "status": "completed",
+#                 "deleted": 0,
+#                 "detail": f"No integrations found for docker_name '{docker_name}'"
+#             }
 
-        placeholder = ",".join(["%s"] * len(profiles))
+#         placeholder = ",".join(["%s"] * len(profiles))
 
-        cursor.execute(
-            f"""
-            DELETE FROM syslog_integration 
-            WHERE profile_id IN ({placeholder})
-            """,
-            profiles
-        )
+#         cursor.execute(
+#             f"""
+#             DELETE FROM syslog_integration 
+#             WHERE profile_id IN ({placeholder})
+#             """,
+#             profiles
+#         )
 
-        deleted_count = cursor.rowcount
-        cnx.commit()
-        cursor.close()
+#         deleted_count = cursor.rowcount
+#         cnx.commit()
+#         cursor.close()
 
-    return {
-        "status": "completed",
-        "deleted": deleted_count,
-        "docker_name": docker_name
-    }
+#     return {
+#         "status": "completed",
+#         "deleted": deleted_count,
+#         "docker_name": docker_name
+#     }
 
 
 # ─────────────────────────────
