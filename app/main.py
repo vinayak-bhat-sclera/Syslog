@@ -43,7 +43,7 @@ async def on_startup():
     device_cache_task = start_background_tasks()
 
     # ✅ Start daily cleanup scheduler (delete syslog_incidents older than 30 days)
-    start_incident_cleanup_scheduler()
+    asyncio.create_task(start_incident_cleanup_scheduler())
     
 
 

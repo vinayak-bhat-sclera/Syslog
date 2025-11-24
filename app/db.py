@@ -5,7 +5,6 @@ import logging
 from typing import Optional
 import asyncio
 
-
 import mysql.connector
 from mysql.connector import pooling
 from app.config import settings
@@ -21,7 +20,9 @@ DB_CONFIG = {
     "port": settings.DB_PORT,
 }
 
-
+# -------------------------------------------------------------
+# INIT CONNECTION POOL
+# -------------------------------------------------------------
 def _init_pool(db_name: str):
     global _pool
     if _pool is not None:
@@ -46,11 +47,15 @@ def _init_pool(db_name: str):
             time.sleep(1)
 
 
+# -------------------------------------------------------------
+# GET CONNECTION
+# -------------------------------------------------------------
 @contextlib.contextmanager
 def get_db_connection(db_name: Optional[str] = None):
     global _pool
     if _pool is None:
         _init_pool(db_name or settings.DB_NAME)
+
     cnx = None
     try:
         cnx = _pool.get_connection()
@@ -66,9 +71,13 @@ def get_db_connection(db_name: Optional[str] = None):
                 logger.exception("Error closing DB connection")
 
 
+# -------------------------------------------------------------
+# INIT DATABASE & TABLES
+# -------------------------------------------------------------
 def init_db():
     tmp_cfg = DB_CONFIG.copy()
 
+    # Create DB first
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
@@ -91,11 +100,12 @@ def init_db():
 
     _init_pool(settings.DB_NAME)
 
+    # Create tables
     with get_db_connection(settings.DB_NAME) as cnx:
         cursor = cnx.cursor()
         try:
             # --------------------------
-            # syslog_profiles (network → docker_name)
+            # syslog_profiles
             # --------------------------
             cursor.execute(
                 """
@@ -111,12 +121,13 @@ def init_db():
                 """
             )
 
-            cursor.execute("SHOW INDEX FROM syslog_profiles WHERE Key_name = %s", ("idx_syslog_profiles_type",))
-            if not cursor.fetchall():
+            # index on type
+            cursor.execute("SHOW INDEX FROM syslog_profiles WHERE Key_name=%s", ("idx_syslog_profiles_type",))
+            if not cursor.fetchone():
                 cursor.execute("CREATE INDEX idx_syslog_profiles_type ON syslog_profiles(type)")
 
             # --------------------------
-            # syslog_integration (network → docker_name)
+            # syslog_integration
             # --------------------------
             cursor.execute(
                 """
@@ -149,7 +160,7 @@ def init_db():
             )
 
             # --------------------------
-            # syslog_incidents (unchanged)
+            # syslog_incidents
             # --------------------------
             cursor.execute(
                 """
@@ -166,49 +177,85 @@ def init_db():
                 """
             )
 
+            # --------------------------------------------------------------
+            # REQUIRED INDEXES (MySQL-safe)
+            # --------------------------------------------------------------
+
+            # index: incidents.device_id
+            cursor.execute(
+                "SHOW INDEX FROM syslog_incidents WHERE Key_name=%s",
+                ("idx_incidents_device_id",)
+            )
+            if not cursor.fetchone():
+                cursor.execute("CREATE INDEX idx_incidents_device_id ON syslog_incidents(device_id)")
+
+            # index: incidents.profile_id
+            cursor.execute(
+                "SHOW INDEX FROM syslog_incidents WHERE Key_name=%s",
+                ("idx_incidents_profile_id",)
+            )
+            if not cursor.fetchone():
+                cursor.execute("CREATE INDEX idx_incidents_profile_id ON syslog_incidents(profile_id)")
+
+            # index: incidents.timestamp
+            cursor.execute(
+                "SHOW INDEX FROM syslog_incidents WHERE Key_name=%s",
+                ("idx_incidents_timestamp",)
+            )
+            if not cursor.fetchone():
+                cursor.execute("CREATE INDEX idx_incidents_timestamp ON syslog_incidents(timestamp)")
+
             cnx.commit()
             logger.info("DB tables initialized successfully.")
+
         finally:
             cursor.close()
 
+
 # -------------------------------------------------------------
-# NEW — CLEANUP FUNCTION
+# CLEANUP — BATCH DELETE OLD INCIDENTS
 # -------------------------------------------------------------
 def cleanup_old_incidents():
     """
-    Delete syslog incidents older than 30 days.
-    Runs once a day from background scheduler.
+    Delete syslog_incidents older than 30 days in batches of 20k.
     """
     try:
+        batch_size = 20000
+        total_deleted = 0
+
         with get_db_connection() as cnx:
             cursor = cnx.cursor()
 
-            cursor.execute(
-                """
-                DELETE FROM syslog_incidents
-                WHERE timestamp < NOW() - INTERVAL 30 DAY
-                """
-            )
-            deleted = cursor.rowcount
-            cnx.commit()
+            while True:
+                cursor.execute(
+                    f"""
+                    DELETE FROM syslog_incidents
+                    WHERE timestamp < NOW() - INTERVAL 30 DAY
+                    LIMIT {batch_size}
+                    """
+                )
+                deleted = cursor.rowcount
+                cnx.commit()
+
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+
             cursor.close()
 
-        logger.info(f"[CLEANUP] Deleted {deleted} old syslog_incidents rows")
+        logger.info(f"[CLEANUP] Deleted {total_deleted} syslog_incidents (older than 30 days)")
 
     except Exception as e:
         logger.error(f"[CLEANUP] Error cleaning old incidents: {e}")
 
 
 # -------------------------------------------------------------
-# NEW — BACKGROUND SCHEDULER LOOP
+# DAILY CLEANUP SCHEDULER
 # -------------------------------------------------------------
 async def start_incident_cleanup_scheduler():
-    """
-    Runs cleanup once every 24 hours 
-    """
-    await asyncio.sleep(5)  # Small delay to let app boot fully
+    await asyncio.sleep(5)
     logger.info("Starting daily syslog_incidents cleanup scheduler...")
 
     while True:
         cleanup_old_incidents()
-        await asyncio.sleep(24 * 60 * 60)  # wait 24h
+        await asyncio.sleep(24 * 60 * 60)
