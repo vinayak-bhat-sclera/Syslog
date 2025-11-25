@@ -43,7 +43,7 @@ async def _fetch_mappings_from_springboot_for_device_ids(
 
     if docker_name:
         docker_name = str(docker_name)  # preserve exact case
-        url = f"{base}/docker/{docker_name}/getdevicedetailsbyids?pageno=1&pagesize=100"
+        url = f"{base}/docker/{docker_name}/getdevicedetailsbyids?pageno=0&pagesize=0"
     else:
         url = f"{base}/api/device/mappings"
 

@@ -90,7 +90,7 @@ async def create_profile(
                 (p.name.strip(), docker_name),
             )
             dup = cursor.fetchone()
-            cursor.fetchall()  # OK here because SELECT returns a result set
+            cursor.fetchall()
             cursor.close()
 
             if dup:
@@ -136,9 +136,9 @@ async def create_profile(
                 spring_url,
                 params={"search_key": search_key_clean, "is_select_all": True},
             )
-
         data = resp.json()
         final_device_ids.update(data)
+        final_device_ids.update(device_ids_input)
 
     # --------------------------------------------------------------------
     # CASE 3
@@ -151,7 +151,6 @@ async def create_profile(
                 spring_url,
                 params={"search_key": search_key_clean, "is_select_all": True},
             )
-
         data = resp.json()
         final_device_ids.update(data)
 
@@ -166,7 +165,6 @@ async def create_profile(
                 spring_url,
                 params={"is_select_all": True},
             )
-
         data = resp.json()
         final_device_ids.update(data)
 
@@ -176,7 +174,48 @@ async def create_profile(
     else:
         case = "none"
 
+    # convert to list
     final_ids_list = sorted(final_device_ids)
+
+    # --------------------------------------------------------------------
+    # NEW FILTERING LOGIC – Prevent reuse of same device under same profile type
+    # --------------------------------------------------------------------
+    existing_map = {}  # device_id → type already assigned
+
+    try:
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT pd.device_id, sp.type
+                FROM syslog_profile_devices pd
+                JOIN syslog_profiles sp ON sp.id = pd.profile_id
+                """
+            )
+            rows = cursor.fetchall() or []
+            cursor.close()
+
+            for r in rows:
+                d = r["device_id"]
+                t = r["type"]
+                # device may appear twice → keep ALL types assigned
+                existing_map.setdefault(d, set()).add(t)
+
+    except Exception:
+        raise HTTPException(500, "Failed loading existing profile mappings")
+
+    # filter out devices violating rules
+    filtered_ids = []
+    for dev_id in final_ids_list:
+        previous_types = existing_map.get(dev_id, set())
+
+        # if same type already exists → skip
+        if p.type in previous_types:
+            continue
+
+        filtered_ids.append(dev_id)
+
+    final_ids_list = filtered_ids
 
     # --------------------------------------------------------------------
     # INSERT INTO DB
@@ -185,7 +224,6 @@ async def create_profile(
         with get_db_connection() as cnx:
             cursor = cnx.cursor(buffered=True)
 
-            # INSERT profile (OK now – removed fetchall)
             cursor.execute(
                 """
                 INSERT INTO syslog_profiles 
@@ -195,7 +233,6 @@ async def create_profile(
                 (pid, p.name, p.type, docker_name, prio_json, fac_json, kws_json),
             )
 
-            # INSERT devices (OK now – removed fetchall)
             for dev_id in final_ids_list:
                 rid = str(uuid.uuid4())
                 cursor.execute(
@@ -747,6 +784,9 @@ async def get_profile_device_details(
     # --------------------------------------------------------------
     if not device_ids:
         return device_details_response
+    #    If frontend sends "", we send "" to SpringBoot exactly.
+    # --------------------------------------------------------------
+    search_param = search_key
 
     # --------------------------------------------------------------
     # 5. Call SpringBoot for device details
@@ -764,7 +804,7 @@ async def get_profile_device_details(
                 params={
                     "page_no": page_no,
                     "page_size": page_size,
-                    "search_key": search_key if search_key else None,
+                    "search_key": search_param,
                 },
             )
 

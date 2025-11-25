@@ -50,25 +50,25 @@ def create_integration(
     # -------------------------------------------------------
     # NEW VALIDATION: destination_name must be unique per docker
     # -------------------------------------------------------
-    with get_db_connection() as cnx:
-        cursor = cnx.cursor(buffered=True, dictionary=True)
-        cursor.execute(
-            """
-            SELECT id 
-            FROM syslog_integration
-            WHERE LOWER(destination_name) = LOWER(%s)
-              AND docker_name = %s
-            """,
-            (i.destination_name.strip(), docker_name),
-        )
-        existing = cursor.fetchone()
-        cursor.close()
+    # with get_db_connection() as cnx:
+    #     cursor = cnx.cursor(buffered=True, dictionary=True)
+    #     cursor.execute(
+    #         """
+    #         SELECT id 
+    #         FROM syslog_integration
+    #         WHERE LOWER(destination_name) = LOWER(%s)
+    #           AND docker_name = %s
+    #         """,
+    #         (i.destination_name.strip(), docker_name),
+    #     )
+    #     existing = cursor.fetchone()
+    #     cursor.close()
 
-    if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"destination_name '{i.destination_name}' already exists"
-        )
+    # if existing:
+    #     raise HTTPException(
+    #         status_code=409,
+    #         detail=f"destination_name '{i.destination_name}' already exists"
+    #     )
 
     # -------------------------------------------------------
     # STRICT ENFORCEMENT (existing logic)

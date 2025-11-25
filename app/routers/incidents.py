@@ -1,6 +1,6 @@
 # app/routers/incidents.py
 import logging
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 
 from fastapi import APIRouter, Query, HTTPException, Path
 from app.db import get_db_connection
@@ -13,6 +13,8 @@ logger = logging.getLogger("app.routers.incidents")
 # ───────────────────────────────────────────────────────────────
 # Get Syslog Incidents for a device_id under a docker_name
 # ───────────────────────────────────────────────────────────────
+from typing import Optional, Any, List
+
 @router.get(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_incidents/{device_id}/incidents",
     status_code=200,
@@ -20,8 +22,8 @@ logger = logging.getLogger("app.routers.incidents")
 def list_incidents(
     username: str = Path(...),
     vdmsid: str = Path(...),
-    docker_name: str = Path(..., description="Docker instance name"),
-    device_id: str = Path(..., description="Device ID whose incidents must be fetched"),
+    docker_name: str = Path(...),
+    device_id: str = Path(...),
 
     priority_code: Optional[Any] = Query(None),
     facility_code: Optional[Any] = Query(None),
@@ -30,16 +32,11 @@ def list_incidents(
     page_size: Any = Query(10),
 ) -> Dict[str, Any]:
 
-    # -----------------------------------------------------------------
-    # DEVICE VALIDATION LOGIC (UPDATED)
-    #
-    # ✔ If docker_name == "all" → ALWAYS ALLOW (ZERO validation)
-    # ✔ If docker_name != "all":
-    #       - If device assigned → enforce docker match
-    #       - If device NOT assigned → ALLOW
-    # -----------------------------------------------------------------
     docker_clean = docker_name.lower().strip()
 
+    # ---------------------------------------------------------
+    # DEVICE VALIDATION
+    # ---------------------------------------------------------
     if docker_clean != "all":
         with get_db_connection() as cnx:
             cursor = cnx.cursor(buffered=True, dictionary=True)
@@ -58,11 +55,9 @@ def list_incidents(
         if row and row["docker_name"] != docker_name:
             raise HTTPException(status_code=403, detail="docker_name mismatch for device_id")
 
-        # If row is None → device not assigned → STILL allowed
-
-    # -----------------------------------------------------------------
-    # Pagination validation (UPDATED to use page_no & page_size)
-    # -----------------------------------------------------------------
+    # ---------------------------------------------------------
+    # Pagination validation
+    # ---------------------------------------------------------
     try:
         page_no = int(page_no)
         page_size = int(page_size)
@@ -72,76 +67,118 @@ def list_incidents(
     if page_no < 1 or page_size < 1:
         raise HTTPException(status_code=422, detail="page_no and page_size must be >= 1")
 
-    # -----------------------------------------------------------------
-    # Convert filters
-    # -----------------------------------------------------------------
-    def convert_optional_int(v):
-        if v is None or (isinstance(v, str) and v.strip() == ""):
+    # ---------------------------------------------------------
+    # Robust multi-value parser
+    # ---------------------------------------------------------
+    def parse_multi_int(value: Optional[Any], field: str) -> Optional[List[int]]:
+        """
+        Accepts ANY of the following:
+            "all"
+            ["all"]
+            "%22all%22"
+            ["1","2","3"]
+            "1,2,3"
+            ["all","5"]
+        Behavior:
+            If "all" appears → DISABLE THAT FILTER → return None
+        """
+
+        if value is None:
             return None
-        try:
-            return int(v)
-        except:
-            raise HTTPException(
-                status_code=422,
-                detail="priority_code and facility_code must be integers"
-            )
 
-    priority_code = convert_optional_int(priority_code)
-    facility_code = convert_optional_int(facility_code)
+        # Normalize everything into a list
+        if isinstance(value, list):
+            values = value
+        else:
+            values = [value]
 
-    # -----------------------------------------------------------------
-    # Build SQL query
-    # -----------------------------------------------------------------
+        cleaned = []
+
+        for v in values:
+            if v is None:
+                continue
+
+            v = str(v).strip()
+
+            # Remove brackets and quotes
+            v = v.strip("[]").strip().strip('"').strip("'")
+
+            # If comma separated → split
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+
+            cleaned.extend(parts)
+
+        # If the ONLY meaningful value is "all" → disable filter
+        only_vals = [c.lower() for c in cleaned if c]
+        if "all" in only_vals:
+            return None
+
+        # Convert to integers
+        result = []
+        for c in cleaned:
+            try:
+                result.append(int(c))
+            except:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{field} contains invalid integer value '{c}'"
+                )
+
+        return result if result else None
+
+    # Apply parsing
+    priority_list = parse_multi_int(priority_code, "priority_code")
+    facility_list = parse_multi_int(facility_code, "facility_code")
+
+    # ---------------------------------------------------------
+    # Build dynamic SQL
+    # ---------------------------------------------------------
+    params = [device_id]
+    where = " WHERE inc.device_id = %s "
+
+    if priority_list is not None:  # add filter only if not "all"
+        placeholders = ",".join(["%s"] * len(priority_list))
+        where += f" AND inc.priority_code IN ({placeholders}) "
+        params.extend(priority_list)
+
+    if facility_list is not None:
+        placeholders = ",".join(["%s"] * len(facility_list))
+        where += f" AND inc.facility_code IN ({placeholders}) "
+        params.extend(facility_list)
+
+    offset = (page_no - 1) * page_size
+
+    sql_items = f"""
+        SELECT inc.id, inc.device_id, inc.profile_id,
+               inc.priority_code, inc.facility_code,
+               inc.message, inc.timestamp
+        FROM syslog_incidents inc
+        {where}
+        ORDER BY inc.timestamp DESC
+        LIMIT %s OFFSET %s
+    """
+
+    sql_count = f"""
+        SELECT COUNT(1) AS cnt
+        FROM syslog_incidents inc
+        {where}
+    """
+
     try:
-        params = [device_id]
-        where = " WHERE inc.device_id = %s "
-
-        if priority_code is not None:
-            where += " AND inc.priority_code = %s"
-            params.append(priority_code)
-
-        if facility_code is not None:
-            where += " AND inc.facility_code = %s"
-            params.append(facility_code)
-
-        offset = (page_no - 1) * page_size
-
-        sql_items = f"""
-            SELECT inc.id, inc.device_id, inc.profile_id,
-                   inc.priority_code, inc.facility_code,
-                   inc.message, inc.timestamp
-            FROM syslog_incidents inc
-            {where}
-            ORDER BY inc.timestamp DESC
-            LIMIT %s OFFSET %s
-        """
-
-        sql_count = f"""
-            SELECT COUNT(1) AS cnt
-            FROM syslog_incidents inc
-            {where}
-        """
-
         with get_db_connection() as cnx:
             cursor = cnx.cursor(buffered=True, dictionary=True)
 
-            # Count
             cursor.execute(sql_count, tuple(params))
             total = cursor.fetchone()["cnt"]
 
-            # Paginated items
             cursor.execute(sql_items, tuple(params + [page_size, offset]))
             rows = cursor.fetchall() or []
             cursor.close()
 
-        # Add human-readable labels
         for r in rows:
             r["priority_label"] = PRIORITY_MAP.get(r.get("priority_code"), "unknown")
             r["facility_label"] = FACILITY_MAP.get(r.get("facility_code"), "unknown")
 
-        # -----------------------------------------------------------------
-        # Final response (unchanged except param name updates)
-        # -----------------------------------------------------------------
         return {
             "status": "success",
             "total": total,
@@ -151,8 +188,8 @@ def list_incidents(
             "filters": {
                 "docker_name": docker_name,
                 "device_id": device_id,
-                "priority_code": priority_code,
-                "facility_code": facility_code,
+                "priority_code": priority_list,
+                "facility_code": facility_list,
             },
             "items": rows,
         }
