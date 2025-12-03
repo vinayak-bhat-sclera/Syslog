@@ -11,7 +11,7 @@ logger = logging.getLogger("app.routers.incidents")
 
 
 # ───────────────────────────────────────────────────────────────
-# Get Syslog Incidents for a device_id under a docker_name
+# Get Syslog Incidents for a device_id (docker validation removed)
 # ───────────────────────────────────────────────────────────────
 from typing import Optional, Any, List
 
@@ -32,28 +32,10 @@ def list_incidents(
     page_size: Any = Query(10),
 ) -> Dict[str, Any]:
 
-    docker_clean = docker_name.lower().strip()
-
     # ---------------------------------------------------------
-    # DEVICE VALIDATION
+    # NOTE: docker validation removed — endpoint now returns
+    # incidents for the given device_id regardless of docker_name
     # ---------------------------------------------------------
-    if docker_clean != "all":
-        with get_db_connection() as cnx:
-            cursor = cnx.cursor(buffered=True, dictionary=True)
-            cursor.execute(
-                """
-                SELECT p.docker_name
-                FROM syslog_profile_devices pd
-                JOIN syslog_profiles p ON p.id = pd.profile_id
-                WHERE pd.device_id = %s
-                """,
-                (device_id,),
-            )
-            row = cursor.fetchone()
-            cursor.close()
-
-        if row and row["docker_name"] != docker_name:
-            raise HTTPException(status_code=403, detail="docker_name mismatch for device_id")
 
     # ---------------------------------------------------------
     # Pagination validation
