@@ -1,5 +1,6 @@
 # app/routers/incidents.py
 import logging
+import datetime
 from typing import Optional, Any, Dict, List
 
 from fastapi import APIRouter, Query, HTTPException, Path
@@ -13,7 +14,7 @@ logger = logging.getLogger("app.routers.incidents")
 # ───────────────────────────────────────────────────────────────
 # Get Syslog Incidents for a device_id (docker validation removed)
 # ───────────────────────────────────────────────────────────────
-from typing import Optional, Any, List
+
 
 @router.get(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_incidents/{device_id}/incidents",
@@ -32,10 +33,7 @@ def list_incidents(
     page_size: Any = Query(10),
 ) -> Dict[str, Any]:
 
-    # ---------------------------------------------------------
-    # NOTE: docker validation removed — endpoint now returns
-    # incidents for the given device_id regardless of docker_name
-    # ---------------------------------------------------------
+    # NOTE: docker validation removed — endpoint returns incidents for device_id regardless of docker_name
 
     # ---------------------------------------------------------
     # Pagination validation
@@ -157,9 +155,38 @@ def list_incidents(
             rows = cursor.fetchall() or []
             cursor.close()
 
+        # ----------------------------
+        # Convert timestamp to server local timezone (Python-side)
+        # - Assumes stored timestamps are UTC (common setup)
+        # - Uses the Python process local timezone (datetime.now().astimezone().tzinfo)
+        # - Formats as "YYYY-MM-DD HH:MM:SS" to match existing DB format
+        # ----------------------------
+        try:
+            local_tz = datetime.datetime.now().astimezone().tzinfo
+        except Exception:
+            local_tz = datetime.timezone.utc
+
         for r in rows:
+            # Add labels as before
             r["priority_label"] = PRIORITY_MAP.get(r.get("priority_code"), "unknown")
             r["facility_label"] = FACILITY_MAP.get(r.get("facility_code"), "unknown")
+
+            # Convert timestamp if present
+            ts = r.get("timestamp")
+            if isinstance(ts, datetime.datetime):
+                # If timestamp is naive, assume UTC
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=datetime.timezone.utc)
+                try:
+                    ts_local = ts.astimezone(local_tz)
+                    # Keep same string format as before (no timezone suffix)
+                    r["timestamp"] = ts_local.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    # On any failure, fall back to original value (stringify)
+                    r["timestamp"] = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime.datetime) else str(ts)
+            else:
+                # Not a datetime (could be string) — leave as-is
+                r["timestamp"] = r.get("timestamp")
 
         return {
             "status": "success",

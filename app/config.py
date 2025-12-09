@@ -8,8 +8,8 @@ class Settings(BaseSettings):
     # Database Configuration
     # ─────────────────────────────
     DB_USER: str = Field("root", env="DB_USER")
-    DB_PASSWORD: str = Field("Mypass123", env="DB_PASSWORD")
-    DB_HOST: str = Field("127.0.0.1", env="DB_HOST")
+    DB_PASSWORD: str = Field("WySq1@ScleraR007", env="DB_PASSWORD")
+    DB_HOST: str = Field("10.255.255.1", env="DB_HOST")
     DB_PORT: int = Field(3306, env="DB_PORT")
     DB_NAME: str = Field("syslog_new", env="DB_NAME")
     DB_POOL_NAME: str = Field("syslog_pool", env="DB_POOL_NAME")
@@ -18,7 +18,9 @@ class Settings(BaseSettings):
     # ─────────────────────────────
     # Application Settings
     # ─────────────────────────────
-    SYSLOG_PORT: int = Field(6666, env="SYSLOG_PORT")
+    SYSLOG_PORT: int = Field(514, env="SYSLOG_PORT")
+    #added
+    SYSLOG_HOST: str = Field("localhost", env="SYSLOG_HOST")
     SIMILARITY_THRESHOLD: float = Field(0.6, env="SIMILARITY_THRESHOLD")
     LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
 
@@ -27,7 +29,7 @@ class Settings(BaseSettings):
     # Spring Boot Service
     # ─────────────────────────────
     SPRINGBOOT_HOST: str = Field("localhost", env="SPRINGBOOT_HOST")
-    SPRINGBOOT_PORT: int = Field(8080, env="SPRINGBOOT_PORT")
+    SPRINGBOOT_PORT: int = Field(8888, env="SPRINGBOOT_PORT")
 
     class Config:
         env_file = ".env"

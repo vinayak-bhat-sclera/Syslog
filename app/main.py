@@ -17,7 +17,7 @@ configure_logging()
 
 app = FastAPI(title="Syslog Server")
 
-# ROUTERS (NO /api PREFIX)
+# ROUTERS 
 app.include_router(health.router, prefix="", tags=["health"])
 app.include_router(profiles.router, prefix="", tags=["profiles"])
 app.include_router(integrations.router, prefix="", tags=["integrations"])
@@ -42,7 +42,7 @@ async def on_startup():
     global device_cache_task
     device_cache_task = start_background_tasks()
 
-    # ✅ Start daily cleanup scheduler (delete syslog_incidents older than 30 days)
+    #Start daily cleanup scheduler (delete syslog_incidents older than 30 days)
     asyncio.create_task(start_incident_cleanup_scheduler())
     
 

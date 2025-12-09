@@ -514,14 +514,14 @@ def get_all_integrations(
     params: List[Any] = []
 
     # ----------------------------------
-    # 1️⃣ Docker Name Filter
+    # Docker Name Filter
     # ----------------------------------
     if docker_name.lower() != "all":
         where_clauses.append("i.docker_name = %s")
         params.append(docker_name)
 
     # ----------------------------------
-    # 2️⃣ Profile Name Multi-Select Filter
+    #  Profile Name Multi-Select Filter
     # ----------------------------------
     if profile_name:
         names = [x.strip().lower() for x in profile_name.split(",") if x.strip()]
@@ -532,7 +532,7 @@ def get_all_integrations(
         params.extend([f"%{n}%" for n in names])
 
     # ----------------------------------
-    # 3️⃣ Search Filter
+    #  Search Filter
     # ----------------------------------
     if search_key:
         where_clauses.append("LOWER(i.destination_name) LIKE %s")

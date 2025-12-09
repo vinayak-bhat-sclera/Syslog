@@ -18,16 +18,13 @@ CACHE_TTL = getattr(settings, "CACHE_TTL", 3600)  # seconds
 # Track last-known device_ids per profile to detect removed device_ids on update/delete
 _PROFILE_DEVICE_MAP: Dict[str, Set[str]] = {}
 
+# Track retry tasks per profile (so we don't start multiple)
+_RETRY_TASKS: Dict[str, asyncio.Task] = {}
+
 # Background control
 _BACKGROUND_TASK: Optional[asyncio.Task] = None
 _REFRESH_INTERVAL_SECONDS = getattr(settings, "CACHE_REFRESH_INTERVAL_SECONDS", 3600)
 _SNAPSHOT_INTERVAL_SECONDS = getattr(settings, "CACHE_SNAPSHOT_INTERVAL_SECONDS", 300)
-
-
-# ---------------------------------------------------------------------
-# ✔ UPDATED — REMOVED OLD WRONG IP LOOKUP FUNCTION
-# OLD `_fetch_from_springboot(ip)` REMOVED SAFELY
-# ---------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------
@@ -97,6 +94,106 @@ async def _fetch_mappings_from_springboot_for_device_ids(
 
 
 # ---------------------------------------------------------------------
+# Retry logic when mappings are missing
+# ---------------------------------------------------------------------
+async def _retry_profile_mappings(
+    profile_id: str,
+    device_ids: List[str],
+    docker_name: Optional[str],
+    interval_seconds: int = 60,
+) -> None:
+    """
+    Background loop: if mappings are missing, retry every `interval_seconds`
+    until mappings are returned, then update cache and stop.
+    """
+    logger.info(
+        "[DEVICE_CACHE RETRY] Starting retry loop for profile %s (interval=%ds)",
+        profile_id,
+        interval_seconds,
+    )
+
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+
+            try:
+                mappings = await _fetch_mappings_from_springboot_for_device_ids(
+                    device_ids, docker_name=docker_name
+                )
+            except Exception:
+                logger.exception(
+                    "[DEVICE_CACHE RETRY] Error fetching mappings for profile %s",
+                    profile_id,
+                )
+                continue
+
+            if not mappings:
+                logger.info(
+                    "[DEVICE_CACHE RETRY] Still no mappings for profile %s, will retry",
+                    profile_id,
+                )
+                continue
+
+            now = int(time.time())
+            async with _CACHE_LOCK:
+                for ip, did in mappings.items():
+                    _DEVICE_CACHE[ip] = (did, now + CACHE_TTL)
+                    logger.info(
+                        "[DEVICE_CACHE RETRY SET] %s -> %s (profile=%s ttl=%ds)",
+                        ip,
+                        did,
+                        profile_id,
+                        CACHE_TTL,
+                    )
+
+            logger.info(
+                "[DEVICE_CACHE RETRY] Mappings obtained for profile %s, stopping retry loop",
+                profile_id,
+            )
+            break
+
+    except asyncio.CancelledError:
+        logger.info(
+            "[DEVICE_CACHE RETRY] Retry task cancelled for profile %s",
+            profile_id,
+        )
+        raise
+    finally:
+        # Clean up entry from retry map (if still pointing to this task)
+        task = _RETRY_TASKS.get(profile_id)
+        if task is asyncio.current_task():
+            _RETRY_TASKS.pop(profile_id, None)
+
+
+def _schedule_retry_for_profile(
+    profile_id: str,
+    device_ids: List[str],
+    docker_name: Optional[str],
+) -> None:
+    """
+    Schedule a retry task for a profile, unless one is already running.
+    """
+    if not device_ids:
+        return
+
+    existing = _RETRY_TASKS.get(profile_id)
+    if existing and not existing.done():
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            "[DEVICE_CACHE RETRY] No running loop; cannot schedule retry for profile %s",
+            profile_id,
+        )
+        return
+
+    task = loop.create_task(_retry_profile_mappings(profile_id, device_ids, docker_name))
+    _RETRY_TASKS[profile_id] = task
+
+
+# ---------------------------------------------------------------------
 # Device Cache Lookup
 # ---------------------------------------------------------------------
 async def get_device_id(ip: str) -> Optional[str]:
@@ -113,7 +210,7 @@ async def get_device_id(ip: str) -> Optional[str]:
 
             _DEVICE_CACHE.pop(ip, None)
 
-    # ❌ REMOVED fallback SpringBoot IP lookup (wrong API)
+    #  REMOVED fallback SpringBoot IP lookup (wrong API)
     logger.debug("[DEVICE_CACHE MISS] no mapping for %s", ip)
     return None
 
@@ -233,9 +330,10 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
 
     if not mappings:
         logger.info(
-            "No mappings returned from springboot for profile %s",
+            "No mappings returned from springboot for profile %s; scheduling retries",
             profile_id,
         )
+        _schedule_retry_for_profile(profile_id, device_ids, docker_name)
         return
 
     now = int(time.time())
@@ -250,13 +348,18 @@ async def refresh_cache_for_profile(profile_id: str) -> None:
                 profile_id,
             )
 
+    # if a retry task is running for this profile, cancel it
+    task = _RETRY_TASKS.get(profile_id)
+    if task and not task.done():
+        task.cancel()
+
 
 # ---------------------------------------------------------------------
 # Full refresh for all profiles
 # ---------------------------------------------------------------------
 async def refresh_all_profiles_cache() -> None:
-    profile_to_device_ids = {}
-    profile_to_docker = {}
+    profile_to_device_ids: Dict[str, List[str]] = {}
+    profile_to_docker: Dict[str, Optional[str]] = {}
 
     try:
         with get_db_connection() as cnx:
@@ -306,6 +409,11 @@ async def refresh_all_profiles_cache() -> None:
             )
 
             if not mappings:
+                logger.info(
+                    "No mappings returned for profile %s during full refresh; scheduling retries",
+                    profile_id,
+                )
+                _schedule_retry_for_profile(profile_id, device_ids, docker_name)
                 continue
 
             async with _CACHE_LOCK:
@@ -317,6 +425,11 @@ async def refresh_all_profiles_cache() -> None:
                         did,
                         profile_id,
                     )
+
+            # cancel any existing retry for this profile
+            task = _RETRY_TASKS.get(profile_id)
+            if task and not task.done():
+                task.cancel()
 
     except Exception:
         logger.exception("Full refresh failed")

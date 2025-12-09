@@ -38,6 +38,7 @@ from fastapi import Query, Body
 class DeviceDeleteBody(BaseModel):
     device_ids: Optional[List[str]] = []
 
+
 router = APIRouter()
 logger = logging.getLogger("app.routers.profiles")
 
@@ -250,6 +251,9 @@ async def create_profile(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"create_profile failed: {e}")
 
+    #  Refresh cache for this new profile
+    asyncio.create_task(notify_profile_change(pid))
+
     return {
         "status": "created",
         "id": pid,
@@ -257,6 +261,7 @@ async def create_profile(
         "final_count": len(final_ids_list),
         "final_device_ids": final_ids_list,
     }
+
 
 # ─────────────────────────────
 # UPDATE PROFILE  (NO DEVICE IDs)
@@ -371,7 +376,6 @@ async def update_profile(
     }
 
 
-
 # ─────────────────────────────
 # DELETE MULTIPLE / SINGLE PROFILES
 # ─────────────────────────────
@@ -451,6 +455,10 @@ async def delete_multiple_profiles(
                 cnx.commit()
                 cursor.close()
 
+            #  Refresh cache for all deleted profiles
+            for pid in deleted:
+                asyncio.create_task(notify_profile_change(pid))
+
             return {
                 "status": "success",
                 "deleted_ids": deleted,
@@ -529,93 +537,16 @@ async def delete_multiple_profiles(
         cnx.commit()
         cursor.close()
 
+    #  Refresh cache for all deleted profiles (matched via filters)
+    for pid in deleted:
+        asyncio.create_task(notify_profile_change(pid))
+
     return {
         "status": "success",
         "deleted_ids": deleted,
         "skipped_ids": [],
         "mode": "all-dockers" if docker_all else "single-docker",
     }
-
-# ─────────────────────────────
-# DELETE ALL PROFILES FOR A DOCKER
-# ─────────────────────────────
-# @router.delete(
-#     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/delete/all",
-#     status_code=status.HTTP_200_OK,
-# )
-# async def delete_all_profiles(
-#     username: str = Path(...),
-#     vdmsid: str = Path(...),
-#     docker_name: str = Path(...),
-# ):
-#     """
-#     Deletes ALL profiles (and their devices + integrations).
-
-#     Modes:
-#     docker_name == "all" → delete EVERYTHING across all dockers.
-#     specific docker_name → delete only profiles belonging to that docker.
-#     """
-#     deleted_ids = []
-
-#     try:
-#         with get_db_connection() as cnx:
-#             cursor = cnx.cursor(dictionary=True)
-
-#             # MODE 1: delete EVERYTHING
-#             if docker_name.lower().strip() == "all":
-#                 cursor.execute("SELECT id FROM syslog_profiles")
-#                 rows = cursor.fetchall() or []
-#                 profile_ids = [r["id"] for r in rows]
-
-#                 if profile_ids:
-#                     cursor.execute("DELETE FROM syslog_integration")
-#                     cursor.execute("DELETE FROM syslog_profile_devices")
-#                     cursor.execute("DELETE FROM syslog_profiles")
-
-#                 cnx.commit()
-#                 cursor.close()
-
-#                 for pid in profile_ids:
-#                     asyncio.create_task(notify_profile_change(pid))
-
-#                 return {
-#                     "status": "deleted_all",
-#                     "count": len(profile_ids),
-#                     "deleted_ids": profile_ids,
-#                     "docker_name": "all",
-#                 }
-
-#             # MODE 2: delete only specific docker
-#             cursor.execute(
-#                 "SELECT id FROM syslog_profiles WHERE docker_name=%s",
-#                 (docker_name,),
-#             )
-#             rows = cursor.fetchall() or []
-#             profile_ids = [r["id"] for r in rows]
-
-#             for pid in profile_ids:
-#                 cursor.execute("DELETE FROM syslog_integration WHERE profile_id=%s", (pid,))
-#                 cursor.execute("DELETE FROM syslog_profile_devices WHERE profile_id=%s", (pid,))
-#                 cursor.execute("DELETE FROM syslog_profiles WHERE id=%s", (pid,))
-#                 deleted_ids.append(pid)
-
-#             cnx.commit()
-#             cursor.close()
-
-#         for pid in deleted_ids:
-#             asyncio.create_task(notify_profile_change(pid))
-
-#     except Exception as e:
-#         logger.exception("delete_all_profiles failed")
-#         raise HTTPException(status_code=400, detail=str(e))
-
-#     return {
-#         "status": "deleted_all",
-#         "count": len(deleted_ids),
-#         "deleted_ids": deleted_ids,
-#         "docker_name": docker_name,
-#     }
-
 
 
 # ─────────────────────────────
@@ -717,7 +648,6 @@ def get_all_profiles(
     }
 
 
-
 # ─────────────────────────────
 # GET SINGLE PROFILE
 # ─────────────────────────────
@@ -784,8 +714,8 @@ async def get_profile_device_details(
     # --------------------------------------------------------------
     if not device_ids:
         return device_details_response
-    #    If frontend sends "", we send "" to SpringBoot exactly.
-    # --------------------------------------------------------------
+
+    # If frontend sends "", we send "" to SpringBoot exactly.
     search_param = search_key
 
     # --------------------------------------------------------------
@@ -836,17 +766,9 @@ async def get_profile_device_details(
     return device_details_response
 
 
-
-
-
-
-
-
-
 #===================================================
 # DELETE DEVICE FOR A PROFILE  new added endpoint
 # ==================================================
-
 @router.post(
     "/user/{username}/vdms/{vdmsid}/docker/{docker_name}/syslog_profiles/{profile_id}/devices/delete",
     status_code=200,
@@ -973,6 +895,9 @@ async def delete_profile_devices(
         logger.exception("delete_profile_devices failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+    # 🔁 Refresh cache after device deletions
+    asyncio.create_task(notify_profile_change(profile_id))
+
     return {
         "status": "completed",
         "case": case,
@@ -982,8 +907,6 @@ async def delete_profile_devices(
         "skipped_ids": sorted(skipped),
         "profile_id": profile_id,
     }
-
-
 
 
 #===================================================
@@ -1060,6 +983,9 @@ async def add_devices_to_profile(
 
         cnx.commit()
         cursor.close()
+
+    #  Refresh cache after adding devices
+    asyncio.create_task(notify_profile_change(profile_id))
 
     # 3 Return result summary
     return {
