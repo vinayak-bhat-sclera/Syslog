@@ -236,19 +236,49 @@ async def clear_cache() -> None:
 
 
 async def _evict_by_device_ids(device_ids: List[str]) -> None:
+    """
+    Evict cache entries for IPs whose device_id is in `device_ids`, BUT only
+    if that device_id no longer exists anywhere in the DB.
+
+    This prevents evicting an IP that is still referenced by another profile.
+    """
     if not device_ids:
         return
 
     ids_set = set(device_ids)
 
-    async with _CACHE_LOCK:
-        to_remove = [
-            ip for ip, (did, _) in _DEVICE_CACHE.items()
-            if did in ids_set
-        ]
-        for ip in to_remove:
-            _DEVICE_CACHE.pop(ip, None)
-            logger.debug("[DEVICE_CACHE EVICT - BY_DEVICE_IDS] evicted %s", ip)
+    try:
+        # Check DB to see which of these device_ids still exist in syslog_profile_devices
+        with get_db_connection() as cnx:
+            cursor = cnx.cursor()
+            # Build placeholders for IN clause
+            placeholders = ",".join(["%s"] * len(ids_set))
+            sql = f"""
+                SELECT DISTINCT device_id FROM syslog_profile_devices
+                WHERE device_id IN ({placeholders})
+            """
+            cursor.execute(sql, tuple(ids_set))
+            rows = cursor.fetchall() or []
+            cursor.close()
+
+        # device_ids that still exist somewhere in DB
+        still_present = {r[0] for r in rows}
+        # device_ids that are truly removed (should be evicted)
+        to_evict_device_ids = ids_set - still_present
+
+        if not to_evict_device_ids:
+            logger.debug("[DEVICE_CACHE EVICT] no device_ids to evict after DB check")
+            return
+
+        async with _CACHE_LOCK:
+            # find IPs that map to device_ids that should be evicted
+            to_remove_ips = [ip for ip, (did, _) in _DEVICE_CACHE.items() if did in to_evict_device_ids]
+            for ip in to_remove_ips:
+                _DEVICE_CACHE.pop(ip, None)
+                logger.debug("[DEVICE_CACHE EVICT - BY_DEVICE_IDS] evicted %s", ip)
+
+    except Exception:
+        logger.exception("Error while evicting by device_ids")
 
 
 async def clear_profile_devices(profile_id: str) -> None:
